@@ -2,7 +2,9 @@
 
 This plugin exposes an implementation of the [TimeSeriesStorage](https://github.com/OpenNMS/opennms-integration-api/blob/v0.4.1/api/src/main/java/org/opennms/integration/api/v1/timeseries/TimeSeriesStorage.java#L40) interface that converts metrics to a Prometheus model and delegates writes & reads via the Prometheus `remote_write` / `remote_read` protocol to any compatible backend (e.g. [Cortex](https://cortexmetrics.io/), Mimir, Thanos, VictoriaMetrics, Prometheus itself).
 
-> **Note:** This plugin was previously published as `opennms-cortex-tss-plugin`. It has been renamed to reflect that it works with any Prometheus `remote_write`-compatible backend, not just Cortex. The OSGi configuration PID (`org.opennms.plugins.tss.cortex`) and Java packages are unchanged for backward compatibility with existing deployments.
+> **Note:** This plugin was previously published as `opennms-cortex-tss-plugin`. It has been renamed to reflect that it works with any Prometheus `remote_write`-compatible backend, not just Cortex.
+>
+> **Upgrading from a previous release:** The OSGi configuration PID has been renamed from `org.opennms.plugins.tss.cortex` to `org.opennms.plugins.tss.prometheus`. Rename your `etc/org.opennms.plugins.tss.cortex.cfg` file to `etc/org.opennms.plugins.tss.prometheus.cfg` (or re-run `config:edit` under the new PID) after upgrading, otherwise the plugin falls back to default values. Java packages are unchanged.
 
 ![arch](assets/prometheus-remotewrite-plugin-arch.png "Plugin Architecture")
 
@@ -37,9 +39,9 @@ feature:repo-add mvn:org.opennms.plugins.timeseries/prometheus-remotewrite-karaf
 feature:install opennms-plugins-prometheus-remotewrite
 ```
 
-Configure (you can omit that if you use the default values). The configuration PID is unchanged from the previous `opennms-cortex-tss-plugin` release so existing deployments keep working:
+Configure (you can omit that if you use the default values):
 ```
-config:edit org.opennms.plugins.tss.cortex
+config:edit org.opennms.plugins.tss.prometheus
 
 property-set writeUrl http://localhost:9009/api/prom/push
 property-set readUrl http://localhost:9009/prometheus/api/v1
