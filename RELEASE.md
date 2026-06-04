@@ -2,7 +2,7 @@
 
 Update pom versions:
 ```
-mvn versions:set -DnewVersion=2.0.0
+mvn versions:set -DnewVersion=2.1.1
 ```
 
 Commit pom update:
@@ -18,7 +18,7 @@ git push
 
 Tag:
 ```
-git tag -u opennms@opennms.org -s v2.0.0
+git tag -u opennms@opennms.org -s v2.1.1
 ```
 
 Rename:
