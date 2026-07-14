@@ -31,3 +31,5 @@ java/bin/
 *.iml
 
 .DS_Store
+# Frontend
+node_modules/
