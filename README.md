@@ -1,4 +1,8 @@
-# OpenNMS Prometheus RemoteWrite Plugin [![CircleCI](https://dl.circleci.com/status-badge/img/gh/OpenNMS-Plugins/opennms-cortex-tss-plugin/tree/main.svg?style=svg)](https://dl.circleci.com/status-badge/redirect/gh/OpenNMS-Plugins/opennms-cortex-tss-plugin/tree/main)
+# OpenNMS Prometheus RemoteWrite Plugin
+
+[![CircleCI](https://dl.circleci.com/status-badge/img/gh/OpenNMS-Plugins/opennms-prometheus-remotewrite-plugin/tree/main.svg?style=svg)](https://dl.circleci.com/status-badge/redirect/gh/OpenNMS-Plugins/opennms-prometheus-remotewrite-plugin/tree/main)
+[![Release](https://img.shields.io/github/v/release/OpenNMS-Plugins/opennms-prometheus-remotewrite-plugin?sort=semver)](https://github.com/OpenNMS-Plugins/opennms-prometheus-remotewrite-plugin/releases)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE.md)
 
 This plugin exposes an implementation of the [TimeSeriesStorage](https://github.com/OpenNMS/opennms-integration-api/blob/v0.4.1/api/src/main/java/org/opennms/integration/api/v1/timeseries/TimeSeriesStorage.java#L40) interface that converts metrics to a Prometheus model and delegates writes & reads via the Prometheus `remote_write` / `remote_read` protocol to any compatible backend (e.g. [Cortex](https://cortexmetrics.io/), Mimir, Thanos, VictoriaMetrics, Prometheus itself).
 
@@ -35,7 +39,7 @@ org.opennms.timeseries.tin.metatags.tag.ifDescr=${interface:if-description}' >> 
 
 From the OpenNMS Karaf shell:
 ```
-feature:repo-add mvn:org.opennms.plugins.timeseries/prometheus-remotewrite-karaf-features/1.0.0-SNAPSHOT/xml
+feature:repo-add mvn:org.opennms.plugins.timeseries/prometheus-remotewrite-karaf-features/2.1.0/xml
 feature:install opennms-plugins-prometheus-remotewrite
 ```
 
@@ -69,3 +73,12 @@ http://localhost:9009/ring
 ### View internal metrics
 
 http://localhost:9009/metrics
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, DCO sign-off, and
+AI-assistance policy. Release process is documented in [RELEASING.md](RELEASING.md).
+
+## License
+
+Licensed under the GNU Affero General Public License v3.0. See [LICENSE.md](LICENSE.md).
