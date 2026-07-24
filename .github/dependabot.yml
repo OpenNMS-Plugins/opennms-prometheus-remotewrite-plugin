@@ -3,7 +3,7 @@ updates:
 
   - package-ecosystem: "maven"
     directory: "/"
-    target-branch: "release-2.x"
+    target-branch: "main"
     reviewers:
       - "OpenNMS/dependabot-reviewers-maven"
     labels:

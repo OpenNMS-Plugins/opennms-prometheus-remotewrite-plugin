@@ -1,4 +1,4 @@
-# OpenNMS Prometheus RemoteWrite Plugin [![CircleCI](https://dl.circleci.com/status-badge/img/gh/OpenNMS-Plugins/opennms-cortex-tss-plugin/tree/master.svg?style=svg)](https://dl.circleci.com/status-badge/redirect/gh/OpenNMS-Plugins/opennms-cortex-tss-plugin/tree/master)
+# OpenNMS Prometheus RemoteWrite Plugin [![CircleCI](https://dl.circleci.com/status-badge/img/gh/OpenNMS-Plugins/opennms-cortex-tss-plugin/tree/main.svg?style=svg)](https://dl.circleci.com/status-badge/redirect/gh/OpenNMS-Plugins/opennms-cortex-tss-plugin/tree/main)
 
 This plugin exposes an implementation of the [TimeSeriesStorage](https://github.com/OpenNMS/opennms-integration-api/blob/v0.4.1/api/src/main/java/org/opennms/integration/api/v1/timeseries/TimeSeriesStorage.java#L40) interface that converts metrics to a Prometheus model and delegates writes & reads via the Prometheus `remote_write` / `remote_read` protocol to any compatible backend (e.g. [Cortex](https://cortexmetrics.io/), Mimir, Thanos, VictoriaMetrics, Prometheus itself).
 
@@ -14,7 +14,7 @@ Start a Prometheus `remote_write`-compatible backend. For Cortex, see https://co
 
 You can also download:
 
-https://github.com/opennms-forge/stack-play/tree/master/standalone-cortex-minimal
+https://github.com/opennms-forge/stack-play/tree/main/standalone-cortex-minimal
 
 and start with
 `docker-compose up`
