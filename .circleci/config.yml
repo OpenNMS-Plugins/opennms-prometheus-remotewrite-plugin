@@ -82,11 +82,11 @@ workflows:
             - "gpg-signing"
           requires:
             - tests
-          filters:
-            tags:
-              only: /^v.*/
-            branches:
-              ignore: /.*/
+          # filters:
+          #   tags:
+          #     only: /^v.*/
+          #   branches:
+          #     ignore: /.*/
 
 jobs:
   build:
