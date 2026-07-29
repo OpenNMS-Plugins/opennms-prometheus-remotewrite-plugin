@@ -2,7 +2,7 @@
     <parent>
         <groupId>org.opennms.plugins.timeseries</groupId>
         <artifactId>prometheus-remotewrite-parent</artifactId>
-        <version>2.1.1-SNAPSHOT</version>
+        <version>2.2.0-SNAPSHOT</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
     <artifactId>prometheus-remotewrite-plugin</artifactId>
@@ -195,6 +195,24 @@
             <artifactId>jna</artifactId>
             <version>5.14.0</version>
             <scope>test</scope>
+        </dependency>
+        <!--
+          Must match the okhttp that actually wins on the classpath. The plugin depends on
+          org.apache.servicemix.bundles.okhttp:3.13.1_1, which ships unrelocated okhttp3.* classes
+          and precedes com.squareup.okhttp3:okhttp:4.12.0 (pulled in by logging-interceptor).
+          MockWebServer 4.x fails at runtime against those 3.13.1 internals.
+        -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>mockwebserver</artifactId>
+            <version>3.13.1</version>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>com.squareup.okhttp3</groupId>
+                    <artifactId>okhttp</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
     </dependencies>
 </project>
