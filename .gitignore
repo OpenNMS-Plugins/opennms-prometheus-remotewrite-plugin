@@ -31,3 +31,9 @@ java/bin/
 *.iml
 
 .DS_Store
+
+# AI tools
+.claude/settings.local.json
+_bmad-output/
+_bmad/
+openspec/
