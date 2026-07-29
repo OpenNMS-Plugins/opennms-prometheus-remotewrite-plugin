@@ -7,8 +7,7 @@ Thanks for your interest in improving the OpenNMS Prometheus RemoteWrite Plugin.
 1. Start from an issue. Open one (bug or enhancement) before writing code so the
    change can be discussed and tracked. Drive-by PRs without an issue may be asked
    to open one first.
-2. Branch from `release-2.x` (the active development line). `master` is updated
-   only by CI merging `release-2.x` forward.
+2. Branch from `main`.
 3. Keep changes focused and follow the existing code style.
 4. Open a PR that references its issue with a closing keyword (`Closes #123`).
 

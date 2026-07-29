@@ -6,7 +6,7 @@ Need help with the OpenNMS Prometheus RemoteWrite Plugin?
   using the bug or enhancement template.
 - **Questions and usage help** — ask the OpenNMS community:
   - Discourse: https://opennms.discourse.group/
-  - Chat: https://chat.opennms.com/
+  - Chat (Mattermost): https://chat.opennms.com/
 - **Security issues** — do not open a public issue; follow [SECURITY.md](SECURITY.md).
 
 For general OpenNMS documentation, see https://docs.opennms.com/.

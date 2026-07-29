@@ -36,7 +36,7 @@ Maven modules:
 - Java package/class names still use `cortex`; the plugin is backend-agnostic
   despite the name. Do not rename packages — it is intentional for compatibility.
 - OSGi config PID is `org.opennms.plugins.tss.prometheus`.
-- Develop against `release-2.x`, not `master` (see [RELEASING.md](RELEASING.md)).
+- Develop against `main`; releases are cut from tags (see [RELEASING.md](RELEASING.md)).
 - Sign off every commit (`git commit -s`) and add an `Assisted-by` trailer for
   AI-assisted work (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 - New/edited source files need the OpenNMS SPDX license header (AGPL-3.0).
