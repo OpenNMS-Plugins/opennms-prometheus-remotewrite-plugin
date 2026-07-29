@@ -82,15 +82,18 @@ workflows:
             - "gpg-signing"
           requires:
             - tests
-          # Snapshots publish from the trunk; releases publish from vX.Y.Z tags.
-          # Feature branches must not deploy — they share the trunk's -SNAPSHOT
-          # version and would overwrite it in OSSRH.
+          # Snapshots publish from the trunk and from maintenance branches; releases
+          # publish from vX.Y.Z tags. Feature branches must not deploy — they share
+          # the trunk's -SNAPSHOT version and would overwrite it in OSSRH.
+          # The job itself refuses to publish a non-SNAPSHOT version from a branch
+          # build; see the guard in the deploy job.
           filters:
             tags:
               only: /^v.*/
             branches:
               only:
                 - main
+                - /^release-.*/
 
 jobs:
   build:
@@ -155,7 +158,21 @@ jobs:
             - v1-dependencies-{{ checksum "pom.xml" }}
 
       - run:
-          name: Upload snapshot
+          name: Publish to Central Portal
           command: |
+            VERSION=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)
+            echo "Project version: ${VERSION}${CIRCLE_TAG:+ (tag ${CIRCLE_TAG})}"
+
+            # RELEASING.md sets the release version on main in its own PR, so between
+            # that merge and the vX.Y.Z tag the trunk carries a non-SNAPSHOT version.
+            # central-publishing-maven-plugin runs with autoPublish=true, so deploying
+            # here would push a real, untagged release to Maven Central - and because
+            # released coordinates are immutable, the later tag build would then fail
+            # on the same GAV. Releases come from tags only.
+            if [ -z "${CIRCLE_TAG}" ] && [ "${VERSION%-SNAPSHOT}" = "${VERSION}" ]; then
+              echo "Refusing to publish release ${VERSION} from a branch build. Push a vX.Y.Z tag instead."
+              exit 0
+            fi
+
             mvn -s .circleci/.circleci.settings.xml -Prelease -DskipTests=true -Dmaven.verify.skip=true -Dmaven.install.skip=true deploy
 
