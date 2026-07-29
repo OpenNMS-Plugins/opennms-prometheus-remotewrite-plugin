@@ -82,11 +82,15 @@ workflows:
             - "gpg-signing"
           requires:
             - tests
-          # filters:
-          #   tags:
-          #     only: /^v.*/
-          #   branches:
-          #     ignore: /.*/
+          # Snapshots publish from the trunk; releases publish from vX.Y.Z tags.
+          # Feature branches must not deploy — they share the trunk's -SNAPSHOT
+          # version and would overwrite it in OSSRH.
+          filters:
+            tags:
+              only: /^v.*/
+            branches:
+              only:
+                - main
 
 jobs:
   build:
