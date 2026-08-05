@@ -238,7 +238,7 @@ public class CortexTSS implements TimeSeriesStorage {
                 samplesWritten.mark(samplesSorted.size());
             } else {
                 // FIXME: Data loss
-                samplesLost.mark(samples.size());
+                samplesLost.mark(samplesSorted.size());
                 LOG.error("Error occurred while storing samples, sample will be lost.", ex);
             }
         });
