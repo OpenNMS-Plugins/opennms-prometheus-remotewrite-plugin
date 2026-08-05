@@ -50,16 +50,27 @@ config:edit org.opennms.plugins.tss.prometheus
 property-set writeUrl http://localhost:9009/api/prom/push
 property-set readUrl http://localhost:9009/prometheus/api/v1
 property-set maxConcurrentHttpConnections 100
-property-set writeTimeoutInMs 1000
-property-set readTimeoutInMs 1000
+property-set writeTimeoutInMs 5000
+property-set readTimeoutInMs 5000
 property-set callTimeoutInMs 10000
 property-set metricCacheSize 1000
 property-set externalTagsCacheSize 1000
-property-set bulkheadMaxWaitDurationInMs 9223372036854775807
+property-set bulkheadMaxWaitDuration 9223372036854775807
+property-set maxSeriesLookback 7776000
+property-set organizationId ""
 property-set asyncWrites false
 
 config:update
 ```
+
+`bulkheadMaxWaitDuration` is how long a caller waits for a bulkhead permit before the write is rejected, in milliseconds.
+Note the property name carries no `InMs` suffix, unlike the other timeouts.
+
+`maxSeriesLookback` is how far back the read path searches for series, in seconds.
+The default `7776000` is 90 days.
+
+`organizationId` is sent as the `X-Scope-OrgID` header on every request, for multi-tenant backends such as Cortex and Mimir.
+Leave it empty for single-tenant setups; the header is then omitted.
 
 `callTimeoutInMs` bounds a remote write call once the HTTP client has started it — connect, write,
 backend processing and reading the acknowledgement. It is distinct from `writeTimeoutInMs`, which
@@ -88,6 +99,34 @@ Update automatically:
 ```
 bundle:watch *
 ```
+
+## Sample ordering and out-of-order rejections
+
+The plugin does **not** guarantee that write requests for a series arrive at the backend in timestamp order, and cannot.
+OpenNMS dispatches consecutive batches across `writer_threads` Disruptor handlers (16 by default), so batch N and N+1 race from the moment they are handed out: whichever reaches `store()` first writes first, whatever `store()` does internally.
+Synchronous writes (the 2.2.0 default) narrow the window because each writer thread waits for its previous batch to land, but they do not close it.
+A backend that rejects out-of-order samples will therefore occasionally drop batches under normal operation, and those samples are lost.
+
+We suggest enabling the backend's out-of-order tolerance window.  The configuration settings in the table below can be applied to their respective backends:
+
+| Backend | Setting | Notes |
+|---|---|---|
+| Grafana Mimir | `limits.out_of_order_time_window` / `-ingester.out-of-order-time-window` | per-tenant; default `0` = reject |
+| Thanos Receive | `--tsdb.out-of-order.time-window` | needs `--compact.enable-vertical-compaction` |
+| Prometheus | `storage.tsdb.out_of_order_time_window` | 2.39+, config file not flag; incompatible with the Thanos *sidecar* ([prometheus#13112](https://github.com/prometheus/prometheus/issues/13112)) |
+| VictoriaMetrics | none needed | accepts out-of-order samples within the retention period |
+| Cortex | version-dependent | check your version before relying on it |
+
+A window covering a few collection intervals (e.g. `10m` with the default 5-minute collection interval) is enough; the races span milliseconds to seconds, not minutes.
+
+### Strict ordering mode
+
+If your backend cannot tolerate out-of-order samples at all, ordering can be forced, at the price of single-threaded writes:
+
+- set `writer_threads=1` in OpenNMS (`org.opennms.timeseries.writer_threads`), **and**
+- keep `asyncWrites=false` in this plugin (the default).
+
+Either alone is insufficient: one writer thread still races against itself with `asyncWrites=true`, and synchronous writes still race across multiple writer threads.
 
 ## Backend tips (Cortex example)
 
