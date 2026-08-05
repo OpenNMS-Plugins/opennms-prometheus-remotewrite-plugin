@@ -90,6 +90,17 @@
             <groupId>com.google.guava</groupId>
             <artifactId>guava</artifactId>
         </dependency>
+        <!--
+          Declared before the servicemix okhttp bundle so okhttp ${okhttp.version} wins the
+          test classpath: the bundle ships unrelocated okhttp3 3.13.1 classes that break
+          MockWebServer 4.x. Test scope only; compile and Karaf runtime are unaffected.
+        -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>${okhttp.version}</version>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.apache.servicemix.bundles</groupId>
             <artifactId>org.apache.servicemix.bundles.okhttp</artifactId>
@@ -105,6 +116,16 @@
             <groupId>com.squareup.okhttp3</groupId>
             <artifactId>logging-interceptor</artifactId>
             <version>${okhttp.version}</version>
+        </dependency>
+        <!--
+          Declared explicitly at compile scope: the test-scoped okhttp above wins Maven's
+          mediation over logging-interceptor's transitive okhttp, which would otherwise
+          demote okio (needed by CortexTSS for okio.ByteString) to test scope.
+        -->
+        <dependency>
+            <groupId>com.squareup.okio</groupId>
+            <artifactId>okio</artifactId>
+            <version>${okio.version}</version>
         </dependency>
         <dependency>
             <groupId>com.google.protobuf</groupId>
@@ -196,23 +217,11 @@
             <version>5.14.0</version>
             <scope>test</scope>
         </dependency>
-        <!--
-          Must match the okhttp that actually wins on the classpath. The plugin depends on
-          org.apache.servicemix.bundles.okhttp:3.13.1_1, which ships unrelocated okhttp3.* classes
-          and precedes com.squareup.okhttp3:okhttp:4.12.0 (pulled in by logging-interceptor).
-          MockWebServer 4.x fails at runtime against those 3.13.1 internals.
-        -->
         <dependency>
             <groupId>com.squareup.okhttp3</groupId>
             <artifactId>mockwebserver</artifactId>
-            <version>3.13.1</version>
+            <version>${okhttp.version}</version>
             <scope>test</scope>
-            <exclusions>
-                <exclusion>
-                    <groupId>com.squareup.okhttp3</groupId>
-                    <artifactId>okhttp</artifactId>
-                </exclusion>
-            </exclusions>
         </dependency>
     </dependencies>
 </project>
