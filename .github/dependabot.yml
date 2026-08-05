@@ -13,3 +13,10 @@ updates:
       include: "scope"
     schedule:
       interval: "daily"
+    ignore:
+      # Karaf must stay aligned with the Meridian foundation branches
+      # (2023/2024/2025 all ship Karaf 4.3.10). Building against 4.4+
+      # produces an Import-Package range [4.4,5) that fails to resolve
+      # there. See PR #135.
+      - dependency-name: "org.apache.karaf*"
+        versions: [">= 4.4.0"]
