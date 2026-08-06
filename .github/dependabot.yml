@@ -25,3 +25,10 @@ updates:
       # behind the Karaf 4.4 upgrade above. See PR #93.
       - dependency-name: "org.slf4j*"
         versions: [">= 2.0.0"]
+      # kotlin.version pins the kotlin-stdlib that backs okhttp 4.12.0,
+      # which is built against kotlin 1.9.x. In kotlin 2.x the managed
+      # kotlin-stdlib-jdk8/-common artifacts are empty relocation shells,
+      # so the pin stops working. Lift when okhttp moves to a kotlin
+      # 2.x-based release. See PR #143.
+      - dependency-name: "org.jetbrains.kotlin*"
+        versions: [">= 2.0.0"]
