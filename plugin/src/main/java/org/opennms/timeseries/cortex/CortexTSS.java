@@ -66,6 +66,7 @@ import org.opennms.integration.api.v1.timeseries.TagMatcher;
 import org.opennms.integration.api.v1.timeseries.TimeSeriesFetchRequest;
 import org.opennms.integration.api.v1.timeseries.TimeSeriesStorage;
 import org.opennms.integration.api.v1.timeseries.immutables.ImmutableTagMatcher.TagMatcherBuilder;
+import org.opennms.timeseries.cortex.batch.NonIsolableWriteException;
 import org.opennms.timeseries.cortex.batch.RemoteWriteSender;
 import org.opennms.timeseries.cortex.batch.RetryableWriteException;
 import org.opennms.timeseries.cortex.batch.ShardedWriteBatcher;
@@ -78,6 +79,7 @@ import org.xerial.snappy.Snappy;
 import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.jmx.JmxReporter;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.Sets;
@@ -141,9 +143,13 @@ public class CortexTSS implements TimeSeriesStorage {
     /** The configured call timeout after clamping to what OkHttp accepts. See sanitizeCallTimeout. */
     private final long callTimeoutInMs;
 
+    /** JMX domain the plugin's metrics are published under - the plugin's config PID. */
+    public static final String JMX_DOMAIN = "org.opennms.plugins.tss.prometheus";
+
     private final MetricRegistry metrics = new MetricRegistry();
     private final Meter samplesWritten = metrics.meter("samplesWritten");
     private final Meter samplesLost = metrics.meter("samplesLost");
+    private final JmxReporter jmxReporter;
 
     // when retrieving aggregated time series data we loose the metric information and thus take it from cache
     private final Cache<String, Metric> metricCache;
@@ -225,6 +231,13 @@ public class CortexTSS implements TimeSeriesStorage {
         } else {
             this.batcher = null;
         }
+
+        // Mirror the registry as MBeans under the plugin's config PID - the same pattern the
+        // timeseries integration layer uses for org.opennms.timeseries - so the JMX collection
+        // already scraping this JVM can trend samplesLost and the rest. See "Monitoring the
+        // plugin" in the README.
+        this.jmxReporter = JmxReporter.forRegistry(metrics).inDomain(JMX_DOMAIN).build();
+        this.jmxReporter.start();
     }
 
     /**
@@ -236,6 +249,26 @@ public class CortexTSS implements TimeSeriesStorage {
             return config.getBatchShards();
         }
         return Math.max(2, Math.min(32, config.getMaxConcurrentHttpConnections() / 8));
+    }
+
+    /**
+     * Whether an HTTP status rejects the request itself - bad credentials (401), wrong tenant
+     * (403), wrong endpoint (404), unsupported payload (415), and the rest of that tail - rather
+     * than one series inside it. Every series in such a request fails identically, so
+     * {@link ShardedWriteBatcher} drops it whole instead of bisecting (see
+     * {@link NonIsolableWriteException}). Rather than enumerate codes, every non-retryable 4xx is
+     * request-level except the two a backend plausibly ties to one series: 400, the remote-write
+     * status for rejected samples, and 413, which a smaller bisected request can fit under.
+     * 429 is retried and never reaches this check.
+     *
+     * <p>403 is a judgment call: a backend enforcing per-series ACLs could in principle 403 one
+     * series, and bisection would rescue the rest. No mainstream backend does - Cortex, Mimir and
+     * Thanos use 400/429 for per-series and limit problems - while a 403 from a misconfigured
+     * credential or tenant is exactly the standing failure whose bisection storm stalls a shard.
+     * If such a backend appears, classify by response body rather than recategorizing 403.
+     */
+    private static boolean isNonIsolableStatus(final int status) {
+        return status >= 400 && status < 500 && status != 400 && status != 413 && status != 429;
     }
 
     /**
@@ -254,6 +287,9 @@ public class CortexTSS implements TimeSeriesStorage {
                         response.code(), response.message(), readBodyQuietly(response));
                 if (response.code() == 429 || response.code() >= 500) {
                     throw new RetryableWriteException(message);
+                }
+                if (isNonIsolableStatus(response.code())) {
+                    throw new NonIsolableWriteException(message);
                 }
                 throw new StorageException(message);
             } catch (IOException e) {
@@ -904,6 +940,9 @@ public class CortexTSS implements TimeSeriesStorage {
 
         client.dispatcher().cancelAll();
 
+        // Unregistered after the drain, so its samplesWritten/samplesLost marks still reach JMX; a
+        // leftover registration would block a reloaded bundle's reporter from registering its own.
+        jmxReporter.stop();
     }
 
     public MetricRegistry getMetrics() {
