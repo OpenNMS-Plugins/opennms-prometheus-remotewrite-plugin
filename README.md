@@ -59,6 +59,14 @@ property-set bulkheadMaxWaitDuration 9223372036854775807
 property-set maxSeriesLookback 7776000
 property-set organizationId ""
 property-set asyncWrites false
+property-set batchingEnabled false
+property-set batchShards 0
+property-set batchMaxSamples 2000
+property-set batchLingerMs 500
+property-set batchShardCapacity 65536
+property-set batchMaxRetries 3
+property-set batchRetryBackoffMs 1000
+property-set batchEnqueueTimeoutMs 5000
 
 config:update
 ```
@@ -100,12 +108,131 @@ Update automatically:
 bundle:watch *
 ```
 
+## Write batching
+
+By default, every `store()` call from OpenNMS becomes one remote-write request. OpenNMS commits one
+attribute group per resource at a time, so those requests are tiny (typically a handful of samples),
+and on large systems the per-request overhead, not bandwidth, becomes the write bottleneck: the
+write rate is capped at `writer_threads / backend latency`, regardless of how small the payloads are.
+
+Setting `batchingEnabled=true` routes writes through a sharded batcher instead. `store()` only
+enqueues samples and returns immediately; a fixed pool of shard writers coalesces them into large
+remote-write requests. This multiplies write throughput by the achieved batch size and improves
+compression, at the cost of up to `batchLingerMs` of added delivery latency.
+
+Batching also gives per-series ordering a structural guarantee (see the next section):
+
+- every series - identified by the exact label set it carries on the wire - is hashed to exactly
+  one shard, so all writes for a series flow through the same shard;
+- each shard sends one request at a time, retries included, so its batches reach the backend in order;
+- within a request, each series appears as a single entry with its samples sorted by timestamp.
+
+Shards send in parallel, which the
+[remote-write specification](https://prometheus.io/docs/specs/prw/remote_write_spec/) explicitly
+allows because their series sets are disjoint.
+
+| Property | Default | Description |
+|---|---|---|
+| `batchingEnabled` | `false` | Route writes through the batcher. When enabled, `asyncWrites` has no effect: `store()` never waits on HTTP either way. |
+| `batchShards` | `0` | Number of shards, i.e. the write parallelism. `0` derives it from `maxConcurrentHttpConnections / 8`, clamped to `2 .. 32`. |
+| `batchMaxSamples` | `2000` | A batch is flushed when it holds this many samples. |
+| `batchLingerMs` | `500` | A batch is flushed this long after its first sample, even if not full. |
+| `batchShardCapacity` | `65536` | Buffered samples per shard. A full shard blocks `store()` up to `batchEnqueueTimeoutMs`, then the write fails and the samples count as lost. |
+| `batchMaxRetries` | `3` | Retries per batch for retryable failures (HTTP 429, 5xx, and I/O errors), with exponential backoff starting at `batchRetryBackoffMs` and capped at 60s. Other 4xx responses are never retried and split two ways. Every 4xx except 400 and 413 rejects the request itself (bad credentials, wrong tenant, wrong endpoint), so every series in it would fail identically: the batch is dropped whole after a single request, with no bisection. 400 and 413 are the two a backend plausibly ties to one bad series, so a coalesced request they reject is bisected and resent in halves, cornering the rejected series in a logarithmic number of resends — only what the backend actually rejects is dropped and counted on `samplesLost`. One retry budget is shared between a batch and every resend its bisection spawns, so a batch occupies its shard for a bounded number of requests and backoffs even when the backend mixes fatal and retryable failures. A request that exhausts the budget is dropped whole, and the shard moves on: samples behind a dropped batch survive. |
+| `batchRetryBackoffMs` | `1000` | Initial retry backoff; doubles per attempt. |
+| `batchEnqueueTimeoutMs` | `5000` | Upper bound on how long one `store()` call may block on full shards, shared across all samples of the call. When it expires, the remaining samples are only accepted if their shards have room. |
+
+Sizing notes:
+
+- `callTimeoutInMs` bounds each batch request, and batched requests are much larger than unbatched
+  ones. The default 10s is still generous for 2000-sample requests, but raise it before raising
+  `batchMaxSamples` significantly.
+- With batching enabled, the OpenNMS `writer_threads` setting no longer determines write
+  parallelism; the shards do. Large `writer_threads` values chosen to compensate for tiny unbatched
+  writes can be reduced toward the default.
+- Delivery is asynchronous once samples are enqueued: a failed batch is visible in the `samplesLost`
+  meter and the plugin log, not as an error to the OpenNMS writer thread.
+
+The batcher adds three metrics to the `opennms-cortex:stats` output: `batch.batchesSent`,
+`batch.retries`, and the `batch.bufferedSamples` gauge. `samplesWritten` and `samplesLost` keep
+their meaning: samples acknowledged by the backend, and samples dropped anywhere in the plugin.
+
+## Monitoring the plugin
+
+The plugin keeps its own counters in a metric registry: `samplesWritten` and `samplesLost`
+(samples acknowledged by the backend, and samples dropped anywhere in the plugin), the
+external-tags cache meters, HTTP client gauges, and — with batching enabled — the `batch.*`
+metrics described above. There are two ways to read it:
+
+- **Interactively**, from the Karaf shell: `opennms-cortex:stats` prints a one-shot dump of the
+  whole registry.
+- **Continuously**, over JMX: the registry is mirrored as MBeans in the OpenNMS JVM under the
+  domain `org.opennms.plugins.tss.prometheus`, the same way OpenNMS's own daemons expose theirs.
+  Object names follow `org.opennms.plugins.tss.prometheus:name=<metric>,type=<meters|gauges>`;
+  meters carry a `Count` attribute (plus rates), gauges a `Value`.
+
+The JMX side means the collection already gathering OpenNMS's own JVM statistics (the
+`OpenNMS-JVM` service, collection `jsr160`, auto-bound to the OpenNMS node by the shipped
+`OpenNMS-JVM` detector in the default foreign-source definition) can trend, graph, and alert on
+the plugin's counters — `samplesLost` is the one to watch — with configuration only: no core
+changes, no rebuild. One step: edit `$OPENNMS_HOME/etc/jmx-datacollection-config.xml` and add
+these mbeans inside the existing `<jmx-collection name="jsr160">` element's `<mbeans>` section:
+
+```xml
+            <mbean name="PrometheusWriteSamples"
+                   objectname="org.opennms.plugins.tss.prometheus:name=samplesWritten,type=meters">
+                <attrib name="Count" alias="samplesWritten" type="counter"/>
+            </mbean>
+            <mbean name="PrometheusLostSamples"
+                   objectname="org.opennms.plugins.tss.prometheus:name=samplesLost,type=meters">
+                <attrib name="Count" alias="samplesLost" type="counter"/>
+            </mbean>
+            <mbean name="PrometheusBatchesSent"
+                   objectname="org.opennms.plugins.tss.prometheus:name=batch.batchesSent,type=meters">
+                <attrib name="Count" alias="batchesSent" type="counter"/>
+            </mbean>
+            <mbean name="PrometheusBatchRetries"
+                   objectname="org.opennms.plugins.tss.prometheus:name=batch.retries,type=meters">
+                <attrib name="Count" alias="batchRetries" type="counter"/>
+            </mbean>
+            <mbean name="PrometheusBatchBuffered"
+                   objectname="org.opennms.plugins.tss.prometheus:name=batch.bufferedSamples,type=gauges">
+                <attrib name="Value" alias="bufferedSamples" type="gauge"/>
+            </mbean>
+```
+
+Then reload collectd (`bin/send-event.pl uei.opennms.org/internal/reloadDaemonConfig --parm
+'daemonName Collectd'`) or restart OpenNMS. The next `OpenNMS-JVM` collection cycle picks the new
+mbeans up; no new service, no collectd-configuration.xml change, no provisioning work.
+
+**Do not** try to extend `jsr160` from a file in `jmx-datacollection-config.d/` instead: OpenNMS
+does not merge same-named collections — the last one loaded replaces the other wholesale
+(`JmxDatacollectionConfig#merge` appends collections and the config DAO maps them by name), so a
+`.d` file named `jsr160` would silently replace the stock collection and its JVM statistics.
+
+A dedicated collection and service (a `.d` file with its own collection name, plus a `<service>`
+and `<collector>` entry in `collectd-configuration.xml` modeled on `OpenNMS-JVM`) also works and
+keeps the shipped file pristine, but requires one extra step the `jsr160` route avoids: collectd
+only collects services bound to a node's interface, and no detector exists for a custom service
+name — so the service must be added to the OpenNMS node's requisition (or a `Jsr160Detector`
+with the matching name added to its foreign-source definition) and synchronized.
+
+Notes:
+- The `batch.*` MBeans only exist while `batchingEnabled=true`; without batching, that part of the
+  collection simply yields no data.
+- The counters are per-JVM and reset on restart; `type="counter"` in the collection definition
+  handles that the same way any counter reset is handled.
+- The collected series are stored through this very plugin, so a nonzero `samplesLost` rate
+  trends in the same place as everything else it stores.
+
 ## Sample ordering and out-of-order rejections
 
-The plugin does **not** guarantee that write requests for a series arrive at the backend in timestamp order, and cannot.
+With batching disabled, the plugin does **not** guarantee that write requests for a series arrive at the backend in timestamp order, and cannot.
 OpenNMS dispatches consecutive batches across `writer_threads` Disruptor handlers (16 by default), so batch N and N+1 race from the moment they are handed out: whichever reaches `store()` first writes first, whatever `store()` does internally.
 Synchronous writes (the 2.2.0 default) narrow the window because each writer thread waits for its previous batch to land, but they do not close it.
 A backend that rejects out-of-order samples will therefore occasionally drop batches under normal operation, and those samples are lost.
+
+With `batchingEnabled=true` the ordering guarantee is structural (see the Write batching section above), and the race collapses to the enqueue step: two OpenNMS writer threads can still hand consecutive collections of the same series to `store()` out of order, but that exposure is microseconds of buffer append rather than a full HTTP round trip, and samples that land in the same batch are sorted anyway. Out-of-order arrivals become rare instead of routine, but they are not impossible, so a small tolerance window is still recommended.
 
 We suggest enabling the backend's out-of-order tolerance window.  The configuration settings in the table below can be applied to their respective backends:
 
@@ -117,16 +244,16 @@ We suggest enabling the backend's out-of-order tolerance window.  The configurat
 | VictoriaMetrics | none needed | accepts out-of-order samples within the retention period |
 | Cortex | version-dependent | check your version before relying on it |
 
-A window covering a few collection intervals (e.g. `10m` with the default 5-minute collection interval) is enough; the races span milliseconds to seconds, not minutes.
+A window covering a few collection intervals (e.g. `10m` with the default 5-minute collection interval) is enough with batching disabled; the races span milliseconds to seconds, not minutes. With batching enabled, a window of a few seconds covers the residual enqueue race.
 
 ### Strict ordering mode
 
 If your backend cannot tolerate out-of-order samples at all, ordering can be forced, at the price of single-threaded writes:
 
 - set `writer_threads=1` in OpenNMS (`org.opennms.timeseries.writer_threads`), **and**
-- keep `asyncWrites=false` in this plugin (the default).
+- either enable batching (`batchingEnabled=true`), or keep `asyncWrites=false` in this plugin (the default).
 
-Either alone is insufficient: one writer thread still races against itself with `asyncWrites=true`, and synchronous writes still race across multiple writer threads.
+With a single writer thread the enqueue race disappears, so batching then provides strict per-series ordering while keeping parallelism across different series, which unbatched synchronous writes cannot. Unbatched, either measure alone is insufficient: one writer thread still races against itself with `asyncWrites=true`, and synchronous writes still race across multiple writer threads.
 
 ## Backend tips (Cortex example)
 

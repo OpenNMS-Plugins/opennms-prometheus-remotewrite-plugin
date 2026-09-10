@@ -1,3 +1,24 @@
+/*
+ * Licensed to The OpenNMS Group, Inc (TOG) under one or more
+ * contributor license agreements.  See the LICENSE.md file
+ * distributed with this work for additional information
+ * regarding copyright ownership.
+ *
+ * TOG licenses this file to You under the GNU Affero General
+ * Public License Version 3 (the "License") or (at your option)
+ * any later version.  You may not use this file except in
+ * compliance with the License.  You may obtain a copy of the
+ * License at:
+ *
+ *      https://www.gnu.org/licenses/agpl-3.0.txt
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * either express or implied.  See the License for the specific
+ * language governing permissions and limitations under the
+ * License.
+ */
 package org.opennms.timeseries.cortex;
 
 import static org.junit.Assert.assertEquals;
@@ -17,6 +38,7 @@ import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
+import org.junit.After;
 import org.junit.Before;
 import org.junit.ClassRule;
 import org.junit.Ignore;
@@ -54,6 +76,13 @@ public class CortexTSSIntegrationTest extends AbstractStorageIntegrationTest {
     public void setUp() throws Exception {
         cortexTss = new CortexTSS(new CortexTSSConfig(), new KVStoreMock());
         super.setUp();
+    }
+
+    // Each test builds a fresh CortexTSS; without a destroy the previous instance's threads and
+    // JMX registration would outlive it and block the next instance's MBeans from registering.
+    @After
+    public void tearDown() throws Exception {
+        cortexTss.destroy();
     }
 
     @Override
