@@ -546,6 +546,7 @@ public class CortexTSS implements TimeSeriesStorage {
             extTagsCacheUsed.mark();
         } else {
             var externalMetricFromDb = kvStore.get(s.getMetric().getKey(), CORTEX_TSS);
+            extTagsCacheMissed.mark();
             if (externalMetricFromDb.isPresent()) {
                 jsonMetrics = new JSONObject(externalMetricFromDb.get().toString());
                 for (Tag tag : s.getMetric().getExternalTags()) {
@@ -569,8 +570,6 @@ public class CortexTSS implements TimeSeriesStorage {
                 // record was already up to date was never cached at all, so every one of its
                 // samples paid a synchronous kvStore.get() (a database round trip) forever.
                 externalTagsCache.put(key, jsonMetrics.toString());
-                //missed caching this record
-                extTagsCacheMissed.mark();
             } else {
                 for (Tag tag : s.getMetric().getExternalTags()) {
                     jsonNewMetric.put(tag.getKey(), tag.getValue());
