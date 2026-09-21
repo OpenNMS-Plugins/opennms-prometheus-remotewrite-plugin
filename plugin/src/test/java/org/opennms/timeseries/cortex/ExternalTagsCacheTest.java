@@ -126,6 +126,19 @@ public class ExternalTagsCacheTest {
         assertEquals("the cache must serve every lookup after the first", 1, kvStore.gets.get());
         assertEquals(1, meter("extTagsModified"));
     }
+    
+    @Test
+    public void countsCacheMissWhenDatabaseRecordIsAbsent() throws Exception{
+    	tss = storage();
+    	Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+
+    	server.enqueue(new MockResponse().setResponseCode(200));
+        tss.store(List.of(sample(metric("ifHCInOctets", "uplink"), now, 1)));
+
+        assertEquals("the missing metric must require one database read", 1, kvStore.gets.get());
+        assertEquals("the missing metric must be written to the database", 1, kvStore.puts.get());
+        assertEquals("the database read must count as a cache miss", 1, meter("extTagsCacheMissed"));
+    }
 
     // ------------------------------------------------------------------
     // Harness
