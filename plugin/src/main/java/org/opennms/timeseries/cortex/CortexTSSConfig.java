@@ -49,6 +49,7 @@ public class CortexTSSConfig {
     private final boolean externalTagsEnabled;
     private final int externalTagsQueueSize;
     private final int externalTagsThreads;
+    private final boolean externalTagsPreload;
 
     public CortexTSSConfig() {
         this(builder());
@@ -79,6 +80,7 @@ public class CortexTSSConfig {
         this.externalTagsEnabled = builder.externalTagsEnabled;
         this.externalTagsQueueSize = builder.externalTagsQueueSize;
         this.externalTagsThreads = builder.externalTagsThreads;
+        this.externalTagsPreload = builder.externalTagsPreload;
     }
 
     /** Will be called via blueprint. The builder can be called when not running as Osgi plugin. */
@@ -105,7 +107,8 @@ public class CortexTSSConfig {
             final long batchEnqueueTimeoutMs,
             final boolean externalTagsEnabled,
             final int externalTagsQueueSize,
-            final int externalTagsThreads) {
+            final int externalTagsThreads,
+            final boolean externalTagsPreload) {
         this(builder()
                 .writeUrl(writeUrl)
                 .readUrl(readUrl)
@@ -129,7 +132,8 @@ public class CortexTSSConfig {
                 .batchEnqueueTimeoutMs(batchEnqueueTimeoutMs)
                 .externalTagsEnabled(externalTagsEnabled)
                 .externalTagsQueueSize(externalTagsQueueSize)
-                .externalTagsThreads(externalTagsThreads));
+                .externalTagsThreads(externalTagsThreads)
+                .externalTagsPreload(externalTagsPreload));
     }
 
     public String getWriteUrl() {
@@ -158,8 +162,9 @@ public class CortexTSSConfig {
 
     /**
      * Slots in the table of series whose external tags are known to be persisted, rounded up to a
-     * power of two, 8 bytes each. Size it above the number of active series. 0 keeps no table, so
-     * every sample is re-checked against the key-value store - asynchronously, but still wasteful.
+     * power of two, 8 bytes each, capped at 1 GiB and a quarter of the heap. Size it at about twice
+     * the number of active series with external tags. 0 keeps no table, so every sample is
+     * re-checked against the key-value store - asynchronously, but still wasteful.
      */
     public long getExternalTagsCacheSize() { return externalTagsCacheSize; }
 
@@ -176,6 +181,15 @@ public class CortexTSSConfig {
     /** Threads reconciling external tags with the key-value store. */
     public int getExternalTagsThreads() {
         return externalTagsThreads;
+    }
+
+    /**
+     * Whether the table is seeded from the stored records on startup. The key-value store returns
+     * all records in one map, so on a very large store this needs heap for all of them at once;
+     * without it every series is checked once, asynchronously, after a restart.
+     */
+    public boolean isExternalTagsPreload() {
+        return externalTagsPreload;
     }
 
     public long getBulkheadMaxWaitDurationInMs() {
@@ -284,6 +298,7 @@ public class CortexTSSConfig {
         private boolean externalTagsEnabled = true;
         private int externalTagsQueueSize = 100_000;
         private int externalTagsThreads = 4;
+        private boolean externalTagsPreload = true;
 
         public Builder writeUrl(final String writeUrl) {
             this.writeUrl = writeUrl;
@@ -399,6 +414,11 @@ public class CortexTSSConfig {
             return this;
         }
 
+        public Builder externalTagsPreload(final boolean externalTagsPreload) {
+            this.externalTagsPreload = externalTagsPreload;
+            return this;
+        }
+
         public CortexTSSConfig build() {
             return new CortexTSSConfig(this);
         }
@@ -430,6 +450,7 @@ public class CortexTSSConfig {
                 .add("externalTagsEnabled=" + externalTagsEnabled)
                 .add("externalTagsQueueSize=" + externalTagsQueueSize)
                 .add("externalTagsThreads=" + externalTagsThreads)
+                .add("externalTagsPreload=" + externalTagsPreload)
                 .toString();
     }
 }

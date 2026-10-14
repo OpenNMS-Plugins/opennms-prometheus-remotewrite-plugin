@@ -21,8 +21,6 @@
  */
 package org.opennms.timeseries.cortex;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
-
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -31,6 +29,7 @@ import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -46,41 +45,42 @@ import org.slf4j.LoggerFactory;
 import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
-import com.google.common.hash.HashFunction;
-import com.google.common.hash.Hasher;
-import com.google.common.hash.Hashing;
 
 /**
  * Keeps the external tags of every series in the key-value store, without ever making the
  * OpenNMS writer thread wait on the database.
  *
- * <p>The write path only has to know one thing per sample: is the stored record already a
- * superset of this sample's external tags? That answer is cached as a 64-bit fingerprint of
- * (metric key, external tags) in a fixed-size table indexed by the metric key - 8 bytes per slot,
- * no objects, no GC pressure. A hit means there is nothing to do. A miss hands the series to a
- * small worker pool that does the database read-merge-write and records the fingerprint on
- * success. {@link #offer(Metric)} never blocks: if the queue is full the series is skipped and
- * picked up again on its next sample.
+ * <p>The write path only has to know one thing per sample: does the stored record already hold
+ * every external tag key of this sample? Values do not matter, because existing tags are never
+ * overwritten. That answer is cached as a 64-bit fingerprint of (metric key, external tag keys)
+ * in a fixed-size table - 8 bytes per slot, no objects, no GC pressure. A hit means there is
+ * nothing to do. A miss hands the series to a small worker pool that does the database
+ * read-merge-write and records the fingerprint on success. {@link #offer(Metric)} never blocks:
+ * if the queue is full the series is skipped and picked up again on its next sample.
  *
- * <p>The table is direct-mapped rather than LRU on purpose. Collection visits every series once
- * per interval in the same order, which made the previous LRU cache evict each entry just before
- * its next use as soon as the fleet outgrew it - a zero hit rate. Here a too-small table only
- * loses the series that collide, so the hit rate degrades in proportion instead of collapsing.
+ * <p>The table is 8-way set-associative with random replacement. Collection visits every series
+ * once per interval in the same order, and under that cyclic pattern any deterministic policy -
+ * the previous LRU cache, or a direct-mapped table - evicts each entry just before its next use
+ * as soon as more series compete for a place than it holds. Eight candidate slots per series
+ * keep the hit rate near 100% up to about half occupancy, and random replacement makes an
+ * undersized table lose hits gradually instead of all at once. See "External tags" in the README
+ * for sizing.
  */
 public class ExternalTagsPersister implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(ExternalTagsPersister.class);
 
-    /** Largest power-of-two table an AtomicLongArray can hold. */
-    private static final int MAX_TABLE_SIZE = 1 << 30;
+    /** Slots per bucket: 8 longs fill one 64-byte cache line. */
+    static final int WAYS = 8;
+
+    /** 1 GiB of table. A typo in the size must not allocate the heap away inside the bean constructor. */
+    static final int MAX_TABLE_SLOTS = 1 << 27;
 
     /** Marks an empty slot. A real fingerprint of 0 is remapped, so it can never read as a hit. */
     private static final long EMPTY = 0L;
 
-    private static final HashFunction FINGERPRINT = Hashing.murmur3_128();
-
     private final KeyValueStore kvStore;
     private final AtomicLongArray table;
-    private final int mask;
+    private final int bucketMask;
     private final ThreadPoolExecutor executor;
     /** Keys queued or in progress, so a series is never checked by two workers at once. */
     private final Set<String> pending = ConcurrentHashMap.newKeySet();
@@ -93,35 +93,33 @@ public class ExternalTagsPersister implements AutoCloseable {
     private final Meter extTagsDropped;
 
     /**
-     * @param cacheSize slots in the fingerprint table, rounded up to a power of two; 0 disables
-     *                  the table, so every sample is re-checked (asynchronously)
+     * @param cacheSize slots in the fingerprint table, rounded up to a power of two and capped at
+     *                  {@link #MAX_TABLE_SLOTS} and a quarter of the heap; 0 keeps no table, so
+     *                  every sample is re-checked (asynchronously)
      * @param queueSize series that may wait for a worker before further ones are skipped
      * @param threads   workers talking to the key-value store
+     * @param preload   seed the table from the stored records on startup
      */
     public ExternalTagsPersister(final KeyValueStore kvStore, final long cacheSize, final int queueSize,
-                                 final int threads, final MetricRegistry registry) {
+                                 final int threads, final boolean preload, final MetricRegistry registry) {
         this.kvStore = Objects.requireNonNull(kvStore);
-        if (queueSize <= 0) {
-            throw new IllegalArgumentException("queueSize must be positive, got " + queueSize);
-        }
-        if (threads <= 0) {
-            throw new IllegalArgumentException("threads must be positive, got " + threads);
-        }
 
-        if (cacheSize > 0) {
-            final int size = cacheSize >= MAX_TABLE_SIZE
-                    ? MAX_TABLE_SIZE
-                    : Integer.highestOneBit((int) Math.max(1, cacheSize - 1)) << 1;
-            this.table = new AtomicLongArray(Math.max(1, size));
-            this.mask = table.length() - 1;
+        final int slots = tableSlotsFor(cacheSize, Runtime.getRuntime().maxMemory());
+        if (slots > 0) {
+            this.table = new AtomicLongArray(slots);
+            this.bucketMask = slots / WAYS - 1;
         } else {
             this.table = null;
-            this.mask = 0;
+            this.bucketMask = 0;
         }
 
+        // Clamped rather than rejected: a throw here would fail the blueprint bean and take all
+        // metric storage down over a typo in an optional tuning property.
+        final int effectiveQueueSize = atLeastOne(queueSize, "externalTagsQueueSize");
+        final int effectiveThreads = atLeastOne(threads, "externalTagsThreads");
         final AtomicInteger threadCount = new AtomicInteger();
-        this.executor = new ThreadPoolExecutor(threads, threads, 0L, TimeUnit.MILLISECONDS,
-                new LinkedBlockingQueue<>(queueSize),
+        this.executor = new ThreadPoolExecutor(effectiveThreads, effectiveThreads, 0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(effectiveQueueSize),
                 r -> {
                     final Thread thread = new Thread(r, "PrometheusExternalTags-" + threadCount.getAndIncrement());
                     thread.setDaemon(true);
@@ -137,10 +135,42 @@ public class ExternalTagsPersister implements AutoCloseable {
         this.extTagsDropped = metrics.meter("extTagsDropped");
         metrics.register("extTagsQueueSize", (Gauge<Integer>) () -> executor.getQueue().size());
 
-        warmUp();
+        if (preload) {
+            warmUp();
+        } else {
+            warmedUp = true;
+        }
 
-        LOG.info("Started external tags persister: tableSlots={}, queueSize={}, threads={}",
-                table == null ? 0 : table.length(), queueSize, threads);
+        LOG.info("Started external tags persister: tableSlots={}, queueSize={}, threads={}, preload={}",
+                slots, effectiveQueueSize, effectiveThreads, preload);
+    }
+
+    /**
+     * The table size for a configured {@code cacheSize}: a power of two of at least one bucket,
+     * never above {@link #MAX_TABLE_SLOTS} or a quarter of {@code maxHeapBytes}. Oversized values
+     * are rounded down with a warning rather than allocated.
+     */
+    static int tableSlotsFor(final long cacheSize, final long maxHeapBytes) {
+        if (cacheSize <= 0) {
+            return 0;
+        }
+        final long heapLimit = Math.max(WAYS, Long.highestOneBit(Math.max(1, maxHeapBytes / 4 / Long.BYTES)));
+        final long limit = Math.min(MAX_TABLE_SLOTS, heapLimit);
+        if (cacheSize > limit) {
+            LOG.warn("externalTagsCacheSize={} exceeds the largest table this JVM can afford ({} slots, {} MiB). "
+                            + "Using {} slots.", cacheSize, limit, limit * Long.BYTES >> 20, limit);
+            return (int) limit;
+        }
+        final long rounded = cacheSize <= WAYS ? WAYS : Long.highestOneBit(cacheSize - 1) << 1;
+        return (int) Math.min(rounded, limit);
+    }
+
+    private static int atLeastOne(final int value, final String name) {
+        if (value > 0) {
+            return value;
+        }
+        LOG.warn("{}={} is not a positive number. Using 1.", name, value);
+        return 1;
     }
 
     /**
@@ -148,32 +178,47 @@ public class ExternalTagsPersister implements AutoCloseable {
      * immediately; the database work, if any, happens on the persister's own threads.
      */
     public void offer(final Metric metric) {
-        final Map<String, String> tags = tagsOf(metric);
+        final Set<Tag> tags = metric.getExternalTags();
         if (tags.isEmpty()) {
             // Nothing to persist, and the read path treats a missing record as "no tags".
             return;
         }
         final String key = metric.getKey();
-        final int slot = slot(key);
-        final long fingerprint = fingerprint(key, tags);
-        if (table != null && table.get(slot) == fingerprint) {
-            extTagsCacheUsed.mark();
-            return;
+        int bucket = 0;
+        long fingerprint = EMPTY;
+        if (table != null) {
+            final long keyHash = hash(key);
+            long tagKeys = 0;
+            for (Tag tag : tags) {
+                tagKeys += hash(tag.getKey());
+            }
+            bucket = bucketOf(keyHash);
+            fingerprint = fingerprint(keyHash, tagKeys);
+            if (contains(bucket, fingerprint)) {
+                extTagsCacheUsed.mark();
+                return;
+            }
         }
-        extTagsCacheMissed.mark();
 
         if (!pending.add(key)) {
-            return; // already on its way
+            return; // already on its way, and already counted
         }
+        extTagsCacheMissed.mark();
+        final Map<String, String> toPersist = new TreeMap<>();
+        for (Tag tag : tags) {
+            toPersist.putIfAbsent(tag.getKey(), tag.getValue());
+        }
+        final int b = bucket;
+        final long fp = fingerprint;
         try {
-            executor.execute(() -> reconcile(key, tags, slot, fingerprint));
+            executor.execute(() -> reconcile(key, toPersist, b, fp));
         } catch (RejectedExecutionException e) {
             pending.remove(key);
             extTagsDropped.mark();
         }
     }
 
-    private void reconcile(final String key, final Map<String, String> tags, final int slot, final long fingerprint) {
+    private void reconcile(final String key, final Map<String, String> tags, final int bucket, final long fingerprint) {
         try {
             final Optional<?> stored = kvStore.get(key, CortexTSS.CORTEX_TSS);
             final JSONObject record = stored.isPresent()
@@ -194,10 +239,10 @@ public class ExternalTagsPersister implements AutoCloseable {
                 }
             }
             if (table != null) {
-                table.set(slot, fingerprint);
+                insert(bucket, fingerprint);
             }
         } catch (RuntimeException e) {
-            // Leave the slot alone, so the next sample of this series tries again.
+            // Leave the table alone, so the next sample of this series tries again.
             extTagPutTransactionFailed.mark();
             LOG.debug("Exception occurred persisting external tags for metric: {}", key, e);
         } finally {
@@ -206,8 +251,10 @@ public class ExternalTagsPersister implements AutoCloseable {
     }
 
     /**
-     * Seeds the table from the stored records, so a restart does not re-check every series. Only
-     * fingerprints are kept; the enumerated records are dropped as soon as they are hashed.
+     * Seeds the table from the stored records, so a restart does not re-check every series. The
+     * Integration API has no paged enumeration: the key-value store hands over every record of
+     * the context in one map, and only then are they hashed and dropped. On a very large store
+     * that map needs its own heap for the duration - see externalTagsPreload in the README.
      */
     @SuppressWarnings("unchecked")
     private void warmUp() {
@@ -224,14 +271,17 @@ public class ExternalTagsPersister implements AutoCloseable {
                 int loaded = 0;
                 for (Map.Entry<String, Object> record : ((Map<String, Object>) records).entrySet()) {
                     try {
-                        final Map<String, String> tags = new TreeMap<>();
-                        new JSONObject(record.getValue().toString()).toMap()
-                                .forEach((k, v) -> tags.put(k, String.valueOf(v)));
-                        if (!tags.isEmpty()) {
-                            // Never displace a fingerprint a worker set meanwhile.
-                            table.compareAndSet(slot(record.getKey()), EMPTY, fingerprint(record.getKey(), tags));
-                            loaded++;
+                        final JSONObject json = new JSONObject(record.getValue().toString());
+                        if (json.isEmpty()) {
+                            continue;
                         }
+                        long tagKeys = 0;
+                        for (String tagKey : json.keySet()) {
+                            tagKeys += hash(tagKey);
+                        }
+                        final long keyHash = hash(record.getKey());
+                        insert(bucketOf(keyHash), fingerprint(keyHash, tagKeys));
+                        loaded++;
                     } catch (RuntimeException e) {
                         LOG.debug("Skipping unreadable external tags record {}", record.getKey(), e);
                     }
@@ -243,39 +293,74 @@ public class ExternalTagsPersister implements AutoCloseable {
         });
     }
 
-    private static Map<String, String> tagsOf(final Metric metric) {
-        final Map<String, String> tags = new TreeMap<>();
-        for (Tag tag : metric.getExternalTags()) {
-            tags.putIfAbsent(tag.getKey(), tag.getValue());
+    private boolean contains(final int bucket, final long fingerprint) {
+        final int base = bucket * WAYS;
+        for (int i = 0; i < WAYS; i++) {
+            if (table.get(base + i) == fingerprint) {
+                return true;
+            }
         }
-        return tags;
+        return false;
     }
 
-    private int slot(final String key) {
-        final int h = key.hashCode() * 0x9E3779B9;
-        return (h ^ (h >>> 16)) & mask;
+    /**
+     * Records a fingerprint: in a free slot of its bucket if there is one, otherwise over a random
+     * one. Random, because the cyclic collection order makes every deterministic victim choice
+     * evict exactly the entry that is needed next.
+     */
+    private void insert(final int bucket, final long fingerprint) {
+        if (contains(bucket, fingerprint)) {
+            return;
+        }
+        final int base = bucket * WAYS;
+        for (int i = 0; i < WAYS; i++) {
+            if (table.get(base + i) == EMPTY && table.compareAndSet(base + i, EMPTY, fingerprint)) {
+                return;
+            }
+        }
+        table.set(base + ThreadLocalRandom.current().nextInt(WAYS), fingerprint);
     }
 
-    /** Assumes {@code tags} iterates in key order, so equal tag sets hash equally. */
-    private static long fingerprint(final String key, final Map<String, String> tags) {
-        final Hasher hasher = FINGERPRINT.newHasher();
-        putString(hasher, key);
-        for (Map.Entry<String, String> tag : tags.entrySet()) {
-            putString(hasher, tag.getKey());
-            putString(hasher, tag.getValue());
-        }
-        final long fingerprint = hasher.hash().asLong();
+    private int bucketOf(final long keyHash) {
+        return (int) (keyHash >>> 32) & bucketMask;
+    }
+
+    /**
+     * Combines the key hash with the sum of the tag key hashes. The sum makes the result
+     * independent of tag order, so neither side has to sort.
+     */
+    private static long fingerprint(final long keyHash, final long tagKeys) {
+        final long fingerprint = mix(keyHash ^ mix(tagKeys + 0x9E3779B97F4A7C15L));
         return fingerprint == EMPTY ? 1L : fingerprint;
     }
 
-    /** Length-prefixed, so ("ab","c") and ("a","bc") cannot collide. */
-    private static void putString(final Hasher hasher, final String value) {
-        final String s = value == null ? "" : value;
-        hasher.putInt(s.length()).putString(s, UTF_8);
+    /** 64-bit FNV-1a over the UTF-16 chars, finished with the murmur3 mixer. Allocates nothing. */
+    static long hash(final CharSequence value) {
+        long h = 0xcbf29ce484222325L;
+        if (value != null) {
+            for (int i = 0; i < value.length(); i++) {
+                h ^= value.charAt(i);
+                h *= 0x100000001b3L;
+            }
+        }
+        return mix(h);
+    }
+
+    private static long mix(long k) {
+        k ^= k >>> 33;
+        k *= 0xff51afd7ed558ccdL;
+        k ^= k >>> 33;
+        k *= 0xc4ceb53a5d1b7ae9L;
+        k ^= k >>> 33;
+        return k;
     }
 
     boolean isWarmedUp() {
         return warmedUp;
+    }
+
+    int tableSlots() {
+        return table == null ? 0 : table.length();
     }
 
     /** Test hook: waits until every queued series has been processed. */

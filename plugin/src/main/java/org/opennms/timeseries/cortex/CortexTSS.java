@@ -208,11 +208,9 @@ public class CortexTSS implements TimeSeriesStorage {
         metrics.register("maxAllowedConcurrentCalls", (Gauge<Integer>) () -> asyncHttpCallsBulkhead.getMetrics().getMaxAllowedConcurrentCalls());
 
         this.externalTagsPersister = config.isExternalTagsEnabled()
-                // Clamped rather than rejected: a throw here would fail the blueprint bean and take
-                // all metric storage down over a typo in an optional tuning property.
                 ? new ExternalTagsPersister(keyValueStore, config.getExternalTagsCacheSize(),
-                        Math.max(1, config.getExternalTagsQueueSize()),
-                        Math.max(1, config.getExternalTagsThreads()), metrics)
+                        config.getExternalTagsQueueSize(), config.getExternalTagsThreads(),
+                        config.isExternalTagsPreload(), metrics)
                 : null;
 
         if (config.isBatchingEnabled()) {
@@ -890,6 +888,11 @@ public class CortexTSS implements TimeSeriesStorage {
 
     public MetricRegistry getMetrics() {
         return metrics;
+    }
+
+    /** For tests. Null when external tags are disabled. */
+    ExternalTagsPersister getExternalTagsPersister() {
+        return externalTagsPersister;
     }
 
     @Override

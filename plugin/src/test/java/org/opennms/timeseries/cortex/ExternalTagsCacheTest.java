@@ -21,22 +21,14 @@
  */
 package org.opennms.timeseries.cortex;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
-import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.After;
 import org.junit.Before;
@@ -69,7 +61,7 @@ public class ExternalTagsCacheTest {
 
     @After
     public void tearDown() throws Exception {
-        kvStore.gate.countDown();
+        kvStore.release();
         if (tss != null) {
             tss.destroy();
             tss = null;
@@ -79,7 +71,7 @@ public class ExternalTagsCacheTest {
 
     @Test
     public void storeDoesNotWaitOnTheKeyValueStore() throws Exception {
-        kvStore.blocked = true; // a database that never answers
+        kvStore.block();
         tss = storage(CortexTSSConfig.builder());
 
         Instant t = Instant.now().truncatedTo(ChronoUnit.SECONDS);
@@ -102,14 +94,16 @@ public class ExternalTagsCacheTest {
         Instant t = Instant.now().truncatedTo(ChronoUnit.SECONDS);
         server.enqueue(new MockResponse().setResponseCode(200));
         tss.store(List.of(sample(metric, t, 0)));
-        await().atMost(Duration.ofSeconds(5)).until(() -> kvStore.store.containsKey(metric.getKey()));
+        // Wait for the worker to finish, not just for the record to appear: the table is
+        // updated after the put, and a sample arriving in between would still miss.
+        tss.getExternalTagsPersister().awaitIdle();
 
         for (int i = 1; i <= 3; i++) {
             server.enqueue(new MockResponse().setResponseCode(200));
             tss.store(List.of(sample(metric, t.plusSeconds(i), i)));
         }
 
-        assertEquals("{\"ifAlias\":\"uplink\"}", kvStore.store.get(metric.getKey()));
+        assertEquals("{\"ifAlias\":\"uplink\"}", kvStore.raw(metric.getKey()));
         assertEquals("only the first sample may read the database", 1, kvStore.gets.get());
         assertEquals(1, kvStore.puts.get());
         assertEquals(3, meter("extTagsCacheUsed"));
@@ -124,6 +118,13 @@ public class ExternalTagsCacheTest {
 
         assertEquals(0, kvStore.gets.get());
         assertEquals(0, kvStore.puts.get());
+        assertEquals(0, kvStore.enumerations.get());
+    }
+
+    @Test
+    public void disabledPreloadSkipsTheEnumeration() throws Exception {
+        tss = storage(CortexTSSConfig.builder().externalTagsPreload(false));
+
         assertEquals(0, kvStore.enumerations.get());
     }
 
@@ -153,40 +154,5 @@ public class ExternalTagsCacheTest {
 
     private static Sample sample(Metric metric, Instant time, double value) {
         return ImmutableSample.builder().metric(metric).time(time).value(value).build();
-    }
-
-    private static final class CountingKVStore extends KVStoreMock {
-        private final Map<String, Object> store = new ConcurrentHashMap<>();
-        private final AtomicInteger gets = new AtomicInteger();
-        private final AtomicInteger puts = new AtomicInteger();
-        private final AtomicInteger enumerations = new AtomicInteger();
-        private final CountDownLatch gate = new CountDownLatch(1);
-        private volatile boolean blocked;
-
-        @Override
-        public Optional get(String key, String context) {
-            gets.incrementAndGet();
-            if (blocked) {
-                try {
-                    gate.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            return Optional.ofNullable(store.get(key));
-        }
-
-        @Override
-        public long put(String key, Object value, String context) {
-            puts.incrementAndGet();
-            store.put(key, value);
-            return 0L;
-        }
-
-        @Override
-        public CompletableFuture<Map> enumerateContextAsync(String context) {
-            enumerations.incrementAndGet();
-            return CompletableFuture.completedFuture(Map.of());
-        }
     }
 }

@@ -31,6 +31,7 @@
             <cm:property name="externalTagsEnabled" value="true" />
             <cm:property name="externalTagsQueueSize" value="100000" />
             <cm:property name="externalTagsThreads" value="4" />
+            <cm:property name="externalTagsPreload" value="true" />
         </cm:default-properties>
     </cm:property-placeholder>
 
@@ -58,6 +59,7 @@
         <argument value="${externalTagsEnabled}" />
         <argument value="${externalTagsQueueSize}" />
         <argument value="${externalTagsThreads}" />
+        <argument value="${externalTagsPreload}" />
     </bean>
 
     <!--Key-value store -->

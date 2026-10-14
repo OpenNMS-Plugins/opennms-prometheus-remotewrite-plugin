@@ -23,18 +23,10 @@ package org.opennms.timeseries.cortex;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.time.Duration;
-import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import org.json.JSONObject;
 import org.junit.After;
@@ -45,6 +37,8 @@ import org.opennms.integration.api.v1.timeseries.immutables.ImmutableMetric;
 import com.codahale.metrics.MetricRegistry;
 
 public class ExternalTagsPersisterTest {
+
+    private static final long GIB = 1L << 30;
 
     private final CountingKVStore kvStore = new CountingKVStore();
     private final MetricRegistry registry = new MetricRegistry();
@@ -129,6 +123,20 @@ public class ExternalTagsPersisterTest {
     }
 
     @Test
+    public void aChangedTagValueNeedsNoDatabaseWork() {
+        // Values are never overwritten, so a renamed ifAlias has nothing to persist.
+        persister = persister(1024, 100);
+        persister.offer(metric("if1", "ifAlias", "uplink"));
+        persister.awaitIdle();
+
+        persister.offer(metric("if1", "ifAlias", "core"));
+        persister.awaitIdle();
+
+        assertEquals(1, kvStore.gets.get());
+        assertEquals(1, meter("extTagsCacheUsed"));
+    }
+
+    @Test
     public void neverBlocksTheCallerOnTheDatabase() {
         kvStore.block();
         persister = persister(1024, 2);
@@ -141,6 +149,21 @@ public class ExternalTagsPersisterTest {
 
         assertTrue("offer() must not wait on the key-value store, took " + elapsedMs + "ms", elapsedMs < 1_000);
         assertTrue("a full queue must drop instead of block", meter("extTagsDropped") > 0);
+    }
+
+    @Test
+    public void countsASeriesThatIsAlreadyPendingAsOneMiss() {
+        // Under database latency a fast series offers many samples while its check is pending;
+        // counting each as a miss would read as "table too small" when the database is slow.
+        kvStore.block();
+        persister = persister(1024, 100);
+        Metric metric = metric("if1", "ifAlias", "uplink");
+
+        for (int i = 0; i < 5; i++) {
+            persister.offer(metric);
+        }
+
+        assertEquals(1, meter("extTagsCacheMissed"));
     }
 
     @Test
@@ -176,19 +199,42 @@ public class ExternalTagsPersisterTest {
     }
 
     @Test
-    public void keepsServingHitsWhenTheTableIsSmallerThanTheFleet() {
-        // The old LRU cache dropped to a zero hit rate as soon as the fleet outgrew it, because
-        // collection visits every series once per interval in the same order.
-        persister = persister(64, 10_000);
-        int series = 256;
-        for (int round = 0; round < 3; round++) {
-            for (int i = 0; i < series; i++) {
-                persister.offer(metric("if" + i, "ifAlias", "a" + i));
-            }
-            persister.awaitIdle();
-        }
-        assertTrue("expected cache hits from a table smaller than the fleet, got none",
-                meter("extTagsCacheUsed") > 0);
+    public void theWarmUpMatchesSamplesWhoseTagValuesChangedSinceTheyWereStored() {
+        Metric metric = metric("if1", "ifAlias", "core");
+        kvStore.seed(metric.getKey(), "{\"ifAlias\":\"uplink\"}");
+        kvStore.enumerate.set(true);
+        persister = persister(1024, 100);
+        await().atMost(Duration.ofSeconds(5)).until(persister::isWarmedUp);
+
+        persister.offer(metric);
+        persister.awaitIdle();
+
+        assertEquals(0, kvStore.gets.get());
+    }
+
+    @Test
+    public void skipsTheWarmUpWhenPreloadIsDisabled() {
+        kvStore.enumerate.set(true);
+        persister = new ExternalTagsPersister(kvStore, 1024, 100, 1, false, registry);
+
+        assertTrue(persister.isWarmedUp());
+        assertEquals(0, kvStore.enumerations.get());
+    }
+
+    @Test
+    public void keepsNearlyEveryHitWhenTheTableIsTwiceTheFleet() {
+        // The access pattern collection produces: every series once per interval, same order.
+        // A direct-mapped table of the same size hits only ~60% here.
+        double hitRate = steadyStateHitRate(1024, 512);
+        assertTrue("hit rate at half occupancy was " + hitRate, hitRate >= 0.9);
+    }
+
+    @Test
+    public void degradesGraduallyWhenTheFleetOutgrowsTheTable() {
+        // 1.5x oversubscribed: no cache can exceed 67% here. Random replacement keeps ~41%; the
+        // previous direct-mapped table kept ~23% and the LRU cache before it 0%.
+        double hitRate = steadyStateHitRate(1024, 1536);
+        assertTrue("hit rate at 1.5x oversubscription was " + hitRate, hitRate >= 0.32);
     }
 
     @Test
@@ -200,8 +246,42 @@ public class ExternalTagsPersisterTest {
         persister.offer(metric);
         persister.awaitIdle();
 
+        assertEquals(0, persister.tableSlots());
         assertEquals(2, kvStore.gets.get());
         assertEquals(1, kvStore.puts.get());
+    }
+
+    @Test
+    public void roundsTheTableUpToWholeBuckets() {
+        assertEquals(0, ExternalTagsPersister.tableSlotsFor(0, 4 * GIB));
+        assertEquals(0, ExternalTagsPersister.tableSlotsFor(-1, 4 * GIB));
+        assertEquals(ExternalTagsPersister.WAYS, ExternalTagsPersister.tableSlotsFor(1, 4 * GIB));
+        assertEquals(1024, ExternalTagsPersister.tableSlotsFor(1000, 4 * GIB));
+        assertEquals(1024, ExternalTagsPersister.tableSlotsFor(1024, 4 * GIB));
+    }
+
+    @Test
+    public void capsAnOversizedTableInsteadOfAllocatingTheHeapAway() {
+        assertEquals("never above 1 GiB of table", ExternalTagsPersister.MAX_TABLE_SLOTS,
+                ExternalTagsPersister.tableSlotsFor(10_000_000_000L, 64 * GIB));
+        assertEquals("never above a quarter of the heap", (int) (GIB / 4 / Long.BYTES),
+                ExternalTagsPersister.tableSlotsFor(10_000_000_000L, GIB));
+        assertEquals("rounding up must not cross the cap either", (int) (GIB / 4 / Long.BYTES),
+                ExternalTagsPersister.tableSlotsFor(GIB / 4 / Long.BYTES + 1, GIB));
+
+        persister = persister(Long.MAX_VALUE, 100);
+        assertTrue(persister.tableSlots() <= ExternalTagsPersister.MAX_TABLE_SLOTS);
+    }
+
+    @Test
+    public void clampsANonPositiveQueueSizeAndThreadCount() {
+        persister = new ExternalTagsPersister(kvStore, 1024, 0, 0, false, registry);
+        Metric metric = metric("if1", "ifAlias", "uplink");
+
+        persister.offer(metric);
+        persister.awaitIdle();
+
+        assertEquals("{\"ifAlias\":\"uplink\"}", kvStore.raw(metric.getKey()));
     }
 
     @Test
@@ -209,7 +289,7 @@ public class ExternalTagsPersisterTest {
         persister = persister(1024, 100);
         persister.close();
         persister.offer(metric("if1", "ifAlias", "uplink"));
-        assertFalse(kvStore.gets.get() > 0);
+        assertEquals(0, kvStore.gets.get());
     }
 
     // ------------------------------------------------------------------
@@ -217,7 +297,28 @@ public class ExternalTagsPersisterTest {
     // ------------------------------------------------------------------
 
     private ExternalTagsPersister persister(long cacheSize, int queueSize) {
-        return new ExternalTagsPersister(kvStore, cacheSize, queueSize, 1, registry);
+        return new ExternalTagsPersister(kvStore, cacheSize, queueSize, 1, true, registry);
+    }
+
+    /** Offers the fleet in the same order for a few intervals, then measures one more. */
+    private double steadyStateHitRate(long tableSlots, int series) {
+        persister = persister(tableSlots, series);
+        Metric[] fleet = new Metric[series];
+        for (int i = 0; i < series; i++) {
+            fleet[i] = metric("if" + i, "ifAlias", "a" + i);
+        }
+        for (int round = 0; round < 4; round++) {
+            for (Metric metric : fleet) {
+                persister.offer(metric);
+            }
+            persister.awaitIdle(); // an interval is long enough for the workers to catch up
+        }
+        long hitsBefore = meter("extTagsCacheUsed");
+        for (Metric metric : fleet) {
+            persister.offer(metric);
+        }
+        persister.awaitIdle();
+        return (meter("extTagsCacheUsed") - hitsBefore) / (double) series;
     }
 
     private long meter(String name) {
@@ -233,65 +334,5 @@ public class ExternalTagsPersisterTest {
             builder.externalTag(externalTags[i], externalTags[i + 1]);
         }
         return builder.build();
-    }
-
-    private static final class CountingKVStore extends KVStoreMock {
-        private final Map<String, Object> store = new ConcurrentHashMap<>();
-        private final AtomicInteger gets = new AtomicInteger();
-        private final AtomicInteger puts = new AtomicInteger();
-        private final AtomicBoolean failPuts = new AtomicBoolean();
-        private final AtomicBoolean enumerate = new AtomicBoolean();
-        private final CountDownLatch gate = new CountDownLatch(1);
-        private volatile boolean blocked;
-
-        void seed(String key, String json) {
-            store.put(key, json);
-        }
-
-        String raw(String key) {
-            Object value = store.get(key);
-            return value == null ? null : value.toString();
-        }
-
-        void block() {
-            blocked = true;
-        }
-
-        void release() {
-            gate.countDown();
-        }
-
-        @Override
-        public Optional get(String key, String context) {
-            gets.incrementAndGet();
-            if (blocked) {
-                try {
-                    gate.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            return Optional.ofNullable(store.get(key));
-        }
-
-        @Override
-        public long put(String key, Object value, String context) {
-            if (failPuts.get()) {
-                throw new RuntimeException("simulated database failure");
-            }
-            puts.incrementAndGet();
-            store.put(key, value);
-            return 0L;
-        }
-
-        @Override
-        public CompletableFuture<Long> putAsync(String key, Object value, String context) {
-            throw new AssertionError("the persister writes synchronously on its own threads");
-        }
-
-        @Override
-        public CompletableFuture<Map> enumerateContextAsync(String context) {
-            return CompletableFuture.completedFuture(enumerate.get() ? new ConcurrentHashMap<>(store) : Map.of());
-        }
     }
 }
