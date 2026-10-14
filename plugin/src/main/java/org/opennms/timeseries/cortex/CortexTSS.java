@@ -51,9 +51,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import java.util.Map;
 
-import org.json.JSONObject;
 import org.opennms.integration.api.v1.distributed.KeyValueStore;
 import org.opennms.integration.api.v1.timeseries.Aggregation;
 import org.opennms.integration.api.v1.timeseries.IntrinsicTagNames;
@@ -161,11 +159,8 @@ public class CortexTSS implements TimeSeriesStorage {
 
     public static final String CORTEX_TSS = "CORTEX_TSS";
     private final KeyValueStore kvStore;
-    private final Cache<String, String> externalTagsCache;
-    private final Meter extTagsModified = metrics.meter("extTagsModified");
-    private final Meter extTagsCacheUsed = metrics.meter("extTagsCacheUsed");
-    private final Meter extTagsCacheMissed = metrics.meter("extTagsCacheMissed");
-    private final Meter extTagPutTransactionFailed = metrics.meter("extTagPutTransactionFailed");
+    /** Keeps external tags in the key-value store off the write path. Null when disabled. */
+    private final ExternalTagsPersister externalTagsPersister;
 
     public CortexTSS(final CortexTSSConfig config, final KeyValueStore keyValueStore) {
         this.config = Objects.requireNonNull(config);
@@ -193,7 +188,6 @@ public class CortexTSS implements TimeSeriesStorage {
                 .connectionPool(connectionPool)
                 .build();
 
-        this.externalTagsCache = CacheBuilder.newBuilder().maximumSize(config.getExternalTagsCacheSize()).build();
         this.kvStore = keyValueStore;
 
         this.metricCache = CacheBuilder.newBuilder().maximumSize(config.getMetricCacheSize()).build();
@@ -213,7 +207,13 @@ public class CortexTSS implements TimeSeriesStorage {
         metrics.register("availableConcurrentCalls", (Gauge<Integer>) () -> asyncHttpCallsBulkhead.getMetrics().getAvailableConcurrentCalls());
         metrics.register("maxAllowedConcurrentCalls", (Gauge<Integer>) () -> asyncHttpCallsBulkhead.getMetrics().getMaxAllowedConcurrentCalls());
 
-        this.kvStore.enumerateContextAsync(CORTEX_TSS).thenAccept(map -> externalTagsCache.putAll((Map<String, String>) map));
+        this.externalTagsPersister = config.isExternalTagsEnabled()
+                // Clamped rather than rejected: a throw here would fail the blueprint bean and take
+                // all metric storage down over a typo in an optional tuning property.
+                ? new ExternalTagsPersister(keyValueStore, config.getExternalTagsCacheSize(),
+                        Math.max(1, config.getExternalTagsQueueSize()),
+                        Math.max(1, config.getExternalTagsThreads()), metrics)
+                : null;
 
         if (config.isBatchingEnabled()) {
             this.batcher = ShardedWriteBatcher.builder()
@@ -513,77 +513,10 @@ public class CortexTSS implements TimeSeriesStorage {
         return configured;
     }
 
+    /** Never blocks: the key-value store is only touched on the persister's own threads. */
     private void persistExternalTags(final Sample s) {
-        // save external tags on a separate database
-        String key = s.getMetric().getKey();
-        var externalTags = externalTagsCache.getIfPresent(key);
-        boolean needUpsert = false;
-
-        JSONObject jsonMetrics = null;
-        JSONObject jsonNewMetric = new JSONObject();
-
-        if (config.getExternalTagsCacheSize() > 0 && externalTags != null) {
-            jsonMetrics = new JSONObject(externalTags);
-            for (Tag tag : s.getMetric().getExternalTags()) {
-                if (!jsonMetrics.has(tag.getKey())) {
-                    jsonMetrics.put(tag.getKey(), tag.getValue());
-                    needUpsert = true;
-                }
-            }
-            if (needUpsert) {
-                kvStore.putAsync(key, jsonMetrics.toString(), CORTEX_TSS)
-                        .whenComplete((res,ex)->{
-                            if(ex != null){
-                                LOG.debug("Exception occurred persisting external tag for metric: " + key );
-                                extTagPutTransactionFailed.mark();
-                            }
-                        });
-                // Refresh the cached entry, or every subsequent sample for this metric re-detects
-                // the same missing tags against the stale entry and repeats the upsert.
-                externalTagsCache.put(key, jsonMetrics.toString());
-                extTagsModified.mark();
-            }
-            extTagsCacheUsed.mark();
-        } else {
-            var externalMetricFromDb = kvStore.get(s.getMetric().getKey(), CORTEX_TSS);
-            if (externalMetricFromDb.isPresent()) {
-                jsonMetrics = new JSONObject(externalMetricFromDb.get().toString());
-                for (Tag tag : s.getMetric().getExternalTags()) {
-                    if (!jsonMetrics.has(tag.getKey())) {
-                        jsonMetrics.put(tag.getKey(), tag.getValue());
-                        needUpsert = true;
-                    }
-                }
-                if (needUpsert) {
-                    kvStore.putAsync(key, jsonMetrics.toString(), CORTEX_TSS)
-                            .whenComplete((res,ex)->{
-                                if(ex != null){
-                                    LOG.debug("Exception occurred persisting external tag for metric: " + key );
-                                    extTagPutTransactionFailed.mark();
-                                }
-                            });
-                    extTagsModified.mark();
-                }
-                // Cache the record whether or not it needed an upsert. This lookup runs on the
-                // write path for every sample; before this line was unconditional, a metric whose
-                // record was already up to date was never cached at all, so every one of its
-                // samples paid a synchronous kvStore.get() (a database round trip) forever.
-                externalTagsCache.put(key, jsonMetrics.toString());
-                //missed caching this record
-                extTagsCacheMissed.mark();
-            } else {
-                for (Tag tag : s.getMetric().getExternalTags()) {
-                    jsonNewMetric.put(tag.getKey(), tag.getValue());
-                }
-                kvStore.putAsync(key, jsonNewMetric.toString(), CORTEX_TSS)
-                        .whenComplete((res,ex)->{
-                            if(ex != null){
-                                LOG.debug("Exception occurred persisting external tag for metric: " + key );
-                                extTagPutTransactionFailed.mark();
-                            }
-                        });
-                externalTagsCache.put(key, jsonNewMetric.toString());
-            }
+        if (externalTagsPersister != null) {
+            externalTagsPersister.offer(s.getMetric());
         }
     }
 
@@ -936,6 +869,9 @@ public class CortexTSS implements TimeSeriesStorage {
        if (batcher != null) {
            // Drain buffered samples while the HTTP client still works.
            batcher.destroy();
+       }
+       if (externalTagsPersister != null) {
+           externalTagsPersister.close();
        }
 
        ExecutorService executorService =  client.dispatcher().executorService();

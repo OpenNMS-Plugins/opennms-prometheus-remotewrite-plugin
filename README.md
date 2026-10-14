@@ -54,7 +54,10 @@ property-set writeTimeoutInMs 5000
 property-set readTimeoutInMs 5000
 property-set callTimeoutInMs 10000
 property-set metricCacheSize 1000
-property-set externalTagsCacheSize 1000
+property-set externalTagsEnabled true
+property-set externalTagsCacheSize 1048576
+property-set externalTagsQueueSize 100000
+property-set externalTagsThreads 4
 property-set bulkheadMaxWaitDuration 9223372036854775807
 property-set maxSeriesLookback 7776000
 property-set organizationId ""
@@ -107,6 +110,32 @@ Update automatically:
 ```
 bundle:watch *
 ```
+
+## External tags
+
+External tags (for example `ifAlias` or `ifDescr`) are not sent to the backend. The plugin keeps
+them per series in the OpenNMS key-value store (PostgreSQL) and attaches them again on the read path.
+
+Keeping that store up to date never blocks a write. Each sample is checked against an in-memory
+table that remembers, per series, a 64-bit fingerprint of the external tags already confirmed in
+the store. On a hit nothing happens. On a miss the series is handed to a small pool of worker
+threads that reads the stored record, adds missing tags (existing tags are never overwritten), and
+records the fingerprint. If the workers fall behind and their queue is full, the series is skipped
+and picked up again on its next sample. Series without external tags are skipped entirely. On
+startup the table is seeded from the stored records, so a restart does not re-check every series.
+
+| Property | Default | Description |
+|---|---|---|
+| `externalTagsEnabled` | `true` | Persist external tags. `false` turns the feature off: the key-value store is never touched on writes, and series read back carry no external tags written from then on. |
+| `externalTagsCacheSize` | `1048576` | Slots in the fingerprint table, rounded up to a power of two, 8 bytes each (the default takes 8 MB). Size it above the number of active series, for example 32M slots (256 MB) for 25M series. A smaller table still works; series that share a slot are just re-checked against the database more often. `0` keeps no table and re-checks every sample. It does **not** disable the feature; use `externalTagsEnabled=false` for that. |
+| `externalTagsQueueSize` | `100000` | Series that may wait for a worker. Beyond that, series are skipped until their next sample and counted on `extTagsDropped`. |
+| `externalTagsThreads` | `4` | Worker threads talking to the key-value store. |
+
+Metrics: `extTagsCacheUsed` (table hits), `extTagsCacheMissed` (series handed to the workers),
+`extTagsModified` (records extended with new tags), `extTagPutTransactionFailed` (failed database
+operations, retried on the next sample), `extTagsDropped`, and the `extTagsQueueSize` gauge. In the
+steady state `extTagsCacheMissed` should be close to zero; if it tracks the write rate, the table
+is too small.
 
 ## Write batching
 
