@@ -54,7 +54,11 @@ property-set writeTimeoutInMs 5000
 property-set readTimeoutInMs 5000
 property-set callTimeoutInMs 10000
 property-set metricCacheSize 1000
-property-set externalTagsCacheSize 1000
+property-set externalTagsEnabled true
+property-set externalTagsCacheSize 1048576
+property-set externalTagsQueueSize 100000
+property-set externalTagsThreads 4
+property-set externalTagsPreload true
 property-set bulkheadMaxWaitDuration 9223372036854775807
 property-set maxSeriesLookback 7776000
 property-set organizationId ""
@@ -107,6 +111,47 @@ Update automatically:
 ```
 bundle:watch *
 ```
+
+## External tags
+
+External tags (for example `ifAlias` or `ifDescr`) are not sent to the backend. The plugin keeps
+them per series in the OpenNMS key-value store (PostgreSQL) and attaches them again on the read path.
+
+Keeping that store up to date never blocks a write. Each sample is checked against an in-memory
+table that remembers, per series, a 64-bit fingerprint of the external tag *keys* already confirmed
+in the store. Values do not count: existing tags are never overwritten, so a changed value has
+nothing to persist. On a hit nothing happens. On a miss the series is handed to a small pool of
+worker threads that reads the stored record, adds missing tags, and records the fingerprint. If the
+workers fall behind and their queue is full, the series is skipped and picked up again on its next
+sample. Series without external tags are skipped entirely.
+
+The table is 8-way set-associative: each series can sit in any of the 8 slots of its bucket, and
+when a bucket is full a random slot is replaced. Collection visits every series once per interval
+in the same order, which is exactly the pattern that makes simpler caches evict each entry just
+before it is needed again. Measured hit rates under that pattern, by number of series with
+external tags per table slot:
+
+| Series per slot | 0.5 | 0.67 | 1.0 | 1.5 | 2.0 |
+|---|---|---|---|---|---|
+| Hit rate | ~98 % | ~95 % | ~75 % | ~41 % | ~21 % |
+
+Every miss costs one asynchronous database read, so size the table at about **twice** the number of
+active series with external tags.
+
+| Property | Default | Description |
+|---|---|---|
+| `externalTagsEnabled` | `true` | Persist external tags. `false` turns the feature off: the key-value store is never touched on writes, and series read back carry no external tags written from then on. |
+| `externalTagsCacheSize` | `1048576` | Slots in the fingerprint table, rounded up to a power of two, 8 bytes each (the default takes 8 MB). Size it at about twice the number of active series with external tags, for example 64M slots (512 MB) for 25M series. The table is capped at 128M slots (1 GiB) and at a quarter of the heap; larger values are rounded down with a warning. `0` keeps no table and re-checks every sample. It does **not** disable the feature; use `externalTagsEnabled=false` for that. |
+| `externalTagsQueueSize` | `100000` | Series that may wait for a worker. Beyond that, series are skipped until their next sample and counted on `extTagsDropped`. |
+| `externalTagsThreads` | `4` | Worker threads talking to the key-value store. |
+| `externalTagsPreload` | `true` | Seed the table from the stored records on startup, so a restart does not re-check every series. The key-value store hands over all records in one map, so the preload briefly needs heap for every stored key and JSON record at once: several GB for tens of millions of series. If that does not fit, set it to `false`; every series is then checked once, asynchronously, after a restart. |
+
+Metrics: `extTagsCacheUsed` (table hits), `extTagsCacheMissed` (series handed to the workers;
+samples of a series whose check is still pending are not counted again), `extTagsModified` (records
+extended with new tags), `extTagPutTransactionFailed` (failed database operations, retried on the
+next sample), `extTagsDropped`, and the `extTagsQueueSize` gauge. In the steady state
+`extTagsCacheMissed` should be close to zero; if it stays a sizable fraction of the write rate, the
+table is too small.
 
 ## Write batching
 

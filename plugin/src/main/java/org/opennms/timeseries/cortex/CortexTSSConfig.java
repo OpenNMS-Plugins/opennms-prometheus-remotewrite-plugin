@@ -46,6 +46,10 @@ public class CortexTSSConfig {
     private final int batchMaxRetries;
     private final long batchRetryBackoffMs;
     private final long batchEnqueueTimeoutMs;
+    private final boolean externalTagsEnabled;
+    private final int externalTagsQueueSize;
+    private final int externalTagsThreads;
+    private final boolean externalTagsPreload;
 
     public CortexTSSConfig() {
         this(builder());
@@ -73,6 +77,10 @@ public class CortexTSSConfig {
         this.batchMaxRetries = builder.batchMaxRetries;
         this.batchRetryBackoffMs = builder.batchRetryBackoffMs;
         this.batchEnqueueTimeoutMs = builder.batchEnqueueTimeoutMs;
+        this.externalTagsEnabled = builder.externalTagsEnabled;
+        this.externalTagsQueueSize = builder.externalTagsQueueSize;
+        this.externalTagsThreads = builder.externalTagsThreads;
+        this.externalTagsPreload = builder.externalTagsPreload;
     }
 
     /** Will be called via blueprint. The builder can be called when not running as Osgi plugin. */
@@ -96,7 +104,11 @@ public class CortexTSSConfig {
             final int batchShardCapacity,
             final int batchMaxRetries,
             final long batchRetryBackoffMs,
-            final long batchEnqueueTimeoutMs) {
+            final long batchEnqueueTimeoutMs,
+            final boolean externalTagsEnabled,
+            final int externalTagsQueueSize,
+            final int externalTagsThreads,
+            final boolean externalTagsPreload) {
         this(builder()
                 .writeUrl(writeUrl)
                 .readUrl(readUrl)
@@ -117,7 +129,11 @@ public class CortexTSSConfig {
                 .batchShardCapacity(batchShardCapacity)
                 .batchMaxRetries(batchMaxRetries)
                 .batchRetryBackoffMs(batchRetryBackoffMs)
-                .batchEnqueueTimeoutMs(batchEnqueueTimeoutMs));
+                .batchEnqueueTimeoutMs(batchEnqueueTimeoutMs)
+                .externalTagsEnabled(externalTagsEnabled)
+                .externalTagsQueueSize(externalTagsQueueSize)
+                .externalTagsThreads(externalTagsThreads)
+                .externalTagsPreload(externalTagsPreload));
     }
 
     public String getWriteUrl() {
@@ -144,7 +160,37 @@ public class CortexTSSConfig {
         return metricCacheSize;
     }
 
+    /**
+     * Slots in the table of series whose external tags are known to be persisted, rounded up to a
+     * power of two, 8 bytes each, capped at 1 GiB and a quarter of the heap. Size it at about twice
+     * the number of active series with external tags. 0 keeps no table, so every sample is
+     * re-checked against the key-value store - asynchronously, but still wasteful.
+     */
     public long getExternalTagsCacheSize() { return externalTagsCacheSize; }
+
+    /** When false, external tags are not persisted at all and the key-value store is never touched on writes. */
+    public boolean isExternalTagsEnabled() {
+        return externalTagsEnabled;
+    }
+
+    /** Series that may wait for an external tags worker; beyond that they are skipped until their next sample. */
+    public int getExternalTagsQueueSize() {
+        return externalTagsQueueSize;
+    }
+
+    /** Threads reconciling external tags with the key-value store. */
+    public int getExternalTagsThreads() {
+        return externalTagsThreads;
+    }
+
+    /**
+     * Whether the table is seeded from the stored records on startup. The key-value store returns
+     * all records in one map, so on a very large store this needs heap for all of them at once;
+     * without it every series is checked once, asynchronously, after a restart.
+     */
+    public boolean isExternalTagsPreload() {
+        return externalTagsPreload;
+    }
 
     public long getBulkheadMaxWaitDurationInMs() {
         return bulkheadMaxWaitDurationInMs;
@@ -235,7 +281,7 @@ public class CortexTSSConfig {
         private long writeTimeoutInMs = 5000;
         private long readTimeoutInMs = 5000;
         private long metricCacheSize = 1000;
-        private long externalTagsCacheSize = 1000;
+        private long externalTagsCacheSize = 1_048_576;
         private long bulkheadMaxWaitDurationInMs = Long.MAX_VALUE;
         private long maxSeriesLookback = 7776000;
         private String organizationId = null;
@@ -249,6 +295,10 @@ public class CortexTSSConfig {
         private int batchMaxRetries = 3;
         private long batchRetryBackoffMs = 1000;
         private long batchEnqueueTimeoutMs = 5000;
+        private boolean externalTagsEnabled = true;
+        private int externalTagsQueueSize = 100_000;
+        private int externalTagsThreads = 4;
+        private boolean externalTagsPreload = true;
 
         public Builder writeUrl(final String writeUrl) {
             this.writeUrl = writeUrl;
@@ -349,6 +399,26 @@ public class CortexTSSConfig {
             return this;
         }
 
+        public Builder externalTagsEnabled(final boolean externalTagsEnabled) {
+            this.externalTagsEnabled = externalTagsEnabled;
+            return this;
+        }
+
+        public Builder externalTagsQueueSize(final int externalTagsQueueSize) {
+            this.externalTagsQueueSize = externalTagsQueueSize;
+            return this;
+        }
+
+        public Builder externalTagsThreads(final int externalTagsThreads) {
+            this.externalTagsThreads = externalTagsThreads;
+            return this;
+        }
+
+        public Builder externalTagsPreload(final boolean externalTagsPreload) {
+            this.externalTagsPreload = externalTagsPreload;
+            return this;
+        }
+
         public CortexTSSConfig build() {
             return new CortexTSSConfig(this);
         }
@@ -377,6 +447,10 @@ public class CortexTSSConfig {
                 .add("batchMaxRetries=" + batchMaxRetries)
                 .add("batchRetryBackoffMs=" + batchRetryBackoffMs)
                 .add("batchEnqueueTimeoutMs=" + batchEnqueueTimeoutMs)
+                .add("externalTagsEnabled=" + externalTagsEnabled)
+                .add("externalTagsQueueSize=" + externalTagsQueueSize)
+                .add("externalTagsThreads=" + externalTagsThreads)
+                .add("externalTagsPreload=" + externalTagsPreload)
                 .toString();
     }
 }

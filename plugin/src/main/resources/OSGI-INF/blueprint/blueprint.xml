@@ -14,7 +14,7 @@
             <cm:property name="writeTimeoutInMs" value="5000" />
             <cm:property name="readTimeoutInMs" value="5000" />
             <cm:property name="metricCacheSize" value="1000" />
-            <cm:property name="externalTagsCacheSize" value="1000" />
+            <cm:property name="externalTagsCacheSize" value="1048576" />
             <cm:property name="bulkheadMaxWaitDuration" value="9223372036854775807" />
             <cm:property name="maxSeriesLookback" value="7776000" />
             <cm:property name="organizationId" value="" />
@@ -28,6 +28,10 @@
             <cm:property name="batchMaxRetries" value="3" />
             <cm:property name="batchRetryBackoffMs" value="1000" />
             <cm:property name="batchEnqueueTimeoutMs" value="5000" />
+            <cm:property name="externalTagsEnabled" value="true" />
+            <cm:property name="externalTagsQueueSize" value="100000" />
+            <cm:property name="externalTagsThreads" value="4" />
+            <cm:property name="externalTagsPreload" value="true" />
         </cm:default-properties>
     </cm:property-placeholder>
 
@@ -52,6 +56,10 @@
         <argument value="${batchMaxRetries}" />
         <argument value="${batchRetryBackoffMs}" />
         <argument value="${batchEnqueueTimeoutMs}" />
+        <argument value="${externalTagsEnabled}" />
+        <argument value="${externalTagsQueueSize}" />
+        <argument value="${externalTagsThreads}" />
+        <argument value="${externalTagsPreload}" />
     </bean>
 
     <!--Key-value store -->

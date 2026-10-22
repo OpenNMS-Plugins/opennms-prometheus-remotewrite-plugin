@@ -2,14 +2,14 @@ package org.opennms.timeseries.cortex;
 
 import org.opennms.integration.api.v1.distributed.KeyValueStore;
 
-import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 
     public class KVStoreMock implements KeyValueStore {
-        private Map<String, Object> kvStore = new HashMap<>();
+        private Map<String, Object> kvStore = new ConcurrentHashMap<>(); // touched by the external tags workers
 
         @Override
         public long put(String key, Object value, String context) {

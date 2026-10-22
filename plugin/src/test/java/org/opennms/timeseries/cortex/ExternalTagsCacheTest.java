@@ -22,16 +22,13 @@
 package org.opennms.timeseries.cortex;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.After;
 import org.junit.Before;
@@ -45,13 +42,9 @@ import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 
 /**
- * Pins down the external tags cache population on the write path.
- *
- * {@code persistExternalTags()} runs for every stored sample. It used to populate the cache only
- * when the database record needed an update, so a metric whose record was already complete (the
- * steady state) was never cached, and every one of its samples paid a synchronous kvStore.get(),
- * a database round trip, forever. Observed in a production deployment as extTagsCacheMissed
- * tracking samplesWritten one to one at 19.5 million.
+ * The write path must never wait on the key-value store (PNNMS-13): before, every cache miss cost
+ * a synchronous database read on the OpenNMS writer thread, which capped write throughput at
+ * writer_threads / database latency.
  */
 public class ExternalTagsCacheTest {
 
@@ -68,6 +61,7 @@ public class ExternalTagsCacheTest {
 
     @After
     public void tearDown() throws Exception {
+        kvStore.release();
         if (tss != null) {
             tss.destroy();
             tss = null;
@@ -76,63 +70,70 @@ public class ExternalTagsCacheTest {
     }
 
     @Test
-    public void cachesTheRecordAfterOneDatabaseReadWhenNoUpsertIsNeeded() throws Exception {
-        Metric metric = metric("ifHCInOctets", "uplink");
-        // The record already exists in the database and is complete: the steady state.
-        kvStore.seed(metric.getKey(), "{\"ifAlias\":\"uplink\"}");
-        tss = storage();
+    public void storeDoesNotWaitOnTheKeyValueStore() throws Exception {
+        kvStore.block();
+        tss = storage(CortexTSSConfig.builder());
 
         Instant t = Instant.now().truncatedTo(ChronoUnit.SECONDS);
-        for (int i = 0; i < 3; i++) {
+        long start = System.nanoTime();
+        for (int i = 0; i < 20; i++) {
+            server.enqueue(new MockResponse().setResponseCode(200));
+            tss.store(List.of(sample(metric("if" + i, "uplink"), t, i)));
+        }
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+        assertTrue("store() waited on the key-value store for " + elapsedMs + "ms", elapsedMs < 5_000);
+        assertEquals(20, meter("samplesWritten"));
+    }
+
+    @Test
+    public void persistsTheTagsAndThenServesEveryLookupFromTheCache() throws Exception {
+        Metric metric = metric("if1", "uplink");
+        tss = storage(CortexTSSConfig.builder());
+
+        Instant t = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        server.enqueue(new MockResponse().setResponseCode(200));
+        tss.store(List.of(sample(metric, t, 0)));
+        // Wait for the worker to finish, not just for the record to appear: the table is
+        // updated after the put, and a sample arriving in between would still miss.
+        tss.getExternalTagsPersister().awaitIdle();
+
+        for (int i = 1; i <= 3; i++) {
             server.enqueue(new MockResponse().setResponseCode(200));
             tss.store(List.of(sample(metric, t.plusSeconds(i), i)));
         }
 
+        assertEquals("{\"ifAlias\":\"uplink\"}", kvStore.raw(metric.getKey()));
         assertEquals("only the first sample may read the database", 1, kvStore.gets.get());
-        assertEquals("a complete record must never be re-written", 0, kvStore.puts.get());
-        assertEquals(1, meter("extTagsCacheMissed"));
-        assertEquals(2, meter("extTagsCacheUsed"));
-        assertEquals(0, meter("extTagsModified"));
+        assertEquals(1, kvStore.puts.get());
+        assertEquals(3, meter("extTagsCacheUsed"));
     }
 
     @Test
-    public void refreshesTheCacheWhenACacheHitNeedsAnUpsert() throws Exception {
-        tss = storage();
-        Instant t = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+    public void disabledExternalTagsNeverTouchTheKeyValueStore() throws Exception {
+        tss = storage(CortexTSSConfig.builder().externalTagsEnabled(false));
 
-        // New metric: miss, absent in the database, created and cached.
         server.enqueue(new MockResponse().setResponseCode(200));
-        tss.store(List.of(sample(metric("ifHCInOctets", "uplink"), t, 1)));
-        assertEquals(1, kvStore.gets.get());
-        assertEquals(1, kvStore.puts.get());
+        tss.store(List.of(sample(metric("if1", "uplink"), Instant.now(), 1)));
 
-        // Same series gains a tag: cache hit, upsert, and the cached entry must be refreshed.
-        Metric withExtra = ImmutableMetric.builder()
-                .intrinsicTag("resourceId", "snmp/1/if1")
-                .intrinsicTag("name", "ifHCInOctets")
-                .metaTag("mtype", Metric.Mtype.counter.name())
-                .externalTag("ifAlias", "uplink")
-                .externalTag("ifDescr", "Ethernet1")
-                .build();
-        server.enqueue(new MockResponse().setResponseCode(200));
-        tss.store(List.of(sample(withExtra, t.plusSeconds(1), 2)));
-        assertEquals(2, kvStore.puts.get());
-        assertEquals(1, meter("extTagsModified"));
+        assertEquals(0, kvStore.gets.get());
+        assertEquals(0, kvStore.puts.get());
+        assertEquals(0, kvStore.enumerations.get());
+    }
 
-        // Unchanged tags again: without the cache refresh above, this would upsert a third time.
-        server.enqueue(new MockResponse().setResponseCode(200));
-        tss.store(List.of(sample(withExtra, t.plusSeconds(2), 3)));
-        assertEquals("an up-to-date cached record must not be re-written", 2, kvStore.puts.get());
-        assertEquals("the cache must serve every lookup after the first", 1, kvStore.gets.get());
-        assertEquals(1, meter("extTagsModified"));
+    @Test
+    public void disabledPreloadSkipsTheEnumeration() throws Exception {
+        tss = storage(CortexTSSConfig.builder().externalTagsPreload(false));
+
+        assertEquals(0, kvStore.enumerations.get());
     }
 
     // ------------------------------------------------------------------
     // Harness
     // ------------------------------------------------------------------
 
-    private CortexTSS storage() {
-        return new CortexTSS(CortexTSSConfig.builder()
+    private CortexTSS storage(CortexTSSConfig.Builder builder) {
+        return new CortexTSS(builder
                 .writeUrl(server.url("/api/prom/push").toString())
                 .readUrl(server.url("/prometheus/api/v1").toString())
                 .build(), kvStore);
@@ -142,10 +143,10 @@ public class ExternalTagsCacheTest {
         return tss.getMetrics().meter(name).getCount();
     }
 
-    private static Metric metric(String name, String ifAlias) {
+    private static Metric metric(String resource, String ifAlias) {
         return ImmutableMetric.builder()
-                .intrinsicTag("resourceId", "snmp/1/if1")
-                .intrinsicTag("name", name)
+                .intrinsicTag("resourceId", "snmp/1/" + resource)
+                .intrinsicTag("name", "ifHCInOctets")
                 .metaTag("mtype", Metric.Mtype.counter.name())
                 .externalTag("ifAlias", ifAlias)
                 .build();
@@ -153,35 +154,5 @@ public class ExternalTagsCacheTest {
 
     private static Sample sample(Metric metric, Instant time, double value) {
         return ImmutableSample.builder().metric(metric).time(time).value(value).build();
-    }
-
-    /**
-     * Counts database reads and writes, and returns an empty map from the enumerate preload so the
-     * constructor cannot mask the cache-miss path under test.
-     */
-    private static final class CountingKVStore extends KVStoreMock {
-        private final AtomicInteger gets = new AtomicInteger();
-        private final AtomicInteger puts = new AtomicInteger();
-
-        void seed(String key, String json) {
-            super.put(key, json, CortexTSS.CORTEX_TSS);
-        }
-
-        @Override
-        public Optional get(String key, String context) {
-            gets.incrementAndGet();
-            return super.get(key, context);
-        }
-
-        @Override
-        public CompletableFuture<Long> putAsync(String key, Object value, String context) {
-            puts.incrementAndGet();
-            return super.putAsync(key, value, context);
-        }
-
-        @Override
-        public CompletableFuture<Map> enumerateContextAsync(String context) {
-            return CompletableFuture.completedFuture(new HashMap<>());
-        }
     }
 }
